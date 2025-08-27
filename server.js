@@ -5,32 +5,33 @@ import { DateTime } from "luxon";
 
 const app = express();
 
-/**
- * CORS
- * Set CORS_ORIGIN on Render to a comma-separated list of allowed origins.
- * Example while testing: "http://localhost:3000,http://localhost:5173"
- * Later add your deployed frontend URL(s), e.g. "https://your-site.netlify.app"
- */
+/* =========================
+   CORS CONFIG
+   ========================= */
+// Example value for testing: "http://localhost:3000,http://localhost:5173"
+// Later: add your deployed frontend URL (e.g. "https://your-frontend.vercel.app")
 const allowed = (process.env.CORS_ORIGIN || "*").split(",");
 app.use(cors({ origin: allowed, credentials: true }));
 
 app.use(express.json({ limit: "1mb" }));
 
-/**
- * MongoDB connection
- * Set MONGODB_URI in Render (DO NOT hard-code creds in code).
- * Example:
- * mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/employee_monitor?retryWrites=true&w=majority
- */
+/* =========================
+   MONGODB CONNECTION
+   ========================= */
+// ⚠️ Make sure MONGODB_URI is set in Railway → Variables
 const mongoUri = process.env.MONGODB_URI;
-if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set. Configure it in Render → Environment.");
+if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set. Configure it in Railway → Environment.");
+
 mongoose
-  .connect(mongoUri)
+  .connect(mongoUri, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  })
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err.message));
 
 /* =========================
-   Schemas & Models
+   SCHEMAS & MODELS
    ========================= */
 const userSchema = new mongoose.Schema({
   name: String,
@@ -70,7 +71,7 @@ const AutoBreak = mongoose.model("auto_break_logs", autoBreakSchema);
 const Settings = mongoose.model("settings", settingsSchema);
 
 /* =========================
-   Helpers
+   HELPERS
    ========================= */
 function assignShift(sessionStart) {
   if (!sessionStart) return { shiftDate: "Unknown", shiftLabel: "General" };
@@ -84,30 +85,21 @@ function assignShift(sessionStart) {
     shiftLabel = "Shift 1 (6 PM – 3 AM)";
   } else if (hour >= 21 || hour < 6) {
     shiftLabel = "Shift 2 (9 PM – 6 AM)";
-    if (hour < 6) {
-      shiftDate = shiftDate.minus({ days: 1 });
-    }
+    if (hour < 6) shiftDate = shiftDate.minus({ days: 1 });
   }
 
-  return {
-    shiftDate: shiftDate.toISODate(),
-    shiftLabel,
-  };
+  return { shiftDate: shiftDate.toISODate(), shiftLabel };
 }
 
 /* =========================
-   Routes
+   ROUTES
    ========================= */
-
-// Health check for Render
 app.get("/healthz", (_req, res) => res.send("ok"));
 
-// Root
 app.get("/", (_req, res) => {
   res.send("✅ Employee Monitoring API is running...");
 });
 
-// Config (static)
 app.get("/config", (_req, res) => {
   res.json({
     generalIdleLimit: 60,
@@ -120,7 +112,6 @@ app.get("/config", (_req, res) => {
   });
 });
 
-// Employees (main data)
 app.get("/employees", async (_req, res) => {
   try {
     const users = await User.find();
@@ -128,13 +119,9 @@ app.get("/employees", async (_req, res) => {
 
     const results = await Promise.all(
       users.map(async (u) => {
-        // Activity logs
         const logs = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
-
-        // AutoBreak logs
         const abreaks = await AutoBreak.find({ user: u.name }).sort({ break_start: 1 });
 
-        // Idle Sessions
         const idleSessions = logs
           .filter((log) => log.status === "Idle" && log.idle_start)
           .map((log) => {
@@ -166,7 +153,6 @@ app.get("/employees", async (_req, res) => {
             };
           });
 
-        // AutoBreak Sessions (merge)
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end = br.break_end ? new Date(br.break_end) : null;
@@ -210,7 +196,7 @@ app.get("/employees", async (_req, res) => {
 });
 
 /* =========================
-   Start server (Render)
+   START SERVER
    ========================= */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
