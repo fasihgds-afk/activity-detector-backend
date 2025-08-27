@@ -4,34 +4,18 @@ import mongoose from "mongoose";
 import { DateTime } from "luxon";
 
 const app = express();
+app.use(cors());
+app.use(express.json());
 
-/**
- * CORS
- * Set CORS_ORIGIN on Render to a comma-separated list of allowed origins.
- * Example while testing: "http://localhost:3000,http://localhost:5173"
- * Later add your deployed frontend URL(s), e.g. "https://your-site.netlify.app"
- */
-const allowed = (process.env.CORS_ORIGIN || "*").split(",");
-app.use(cors({ origin: allowed, credentials: true }));
-
-app.use(express.json({ limit: "1mb" }));
-
-/**
- * MongoDB connection
- * Set MONGODB_URI in Render (DO NOT hard-code creds in code).
- * Example:
- * mongodb+srv://<user>:<pass>@<cluster>.mongodb.net/employee_monitor?retryWrites=true&w=majority
- */
-const mongoUri = process.env.MONGODB_URI;
-if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set. Configure it in Render → Environment.");
+// ✅ MongoDB connection
 mongoose
-  .connect(mongoUri)
+  .connect(
+    "mongodb+srv://employee:Employee%402025@cluster0.uzmlw01.mongodb.net/employee_monitor?retryWrites=true&w=majority&appName=Cluster0"
+  )
   .then(() => console.log("✅ MongoDB Connected"))
-  .catch((err) => console.error("❌ MongoDB Error:", err.message));
+  .catch((err) => console.error("❌ MongoDB Error:", err));
 
-/* =========================
-   Schemas & Models
-   ========================= */
+// ✅ Schemas
 const userSchema = new mongoose.Schema({
   name: String,
   department: String,
@@ -42,7 +26,7 @@ const userSchema = new mongoose.Schema({
 
 const activitySchema = new mongoose.Schema({
   user: String,
-  status: String, // "Active" / "Idle"
+  status: String, // Active / Idle
   reason: String,
   category: String,
   timestamp: Date,
@@ -69,13 +53,15 @@ const ActivityLog = mongoose.model("activity_logs", activitySchema);
 const AutoBreak = mongoose.model("auto_break_logs", autoBreakSchema);
 const Settings = mongoose.model("settings", settingsSchema);
 
-/* =========================
-   Helpers
-   ========================= */
+// -------------------------
+// Shift Logic
+// -------------------------
 function assignShift(sessionStart) {
   if (!sessionStart) return { shiftDate: "Unknown", shiftLabel: "General" };
 
-  const dt = DateTime.fromJSDate(sessionStart, { zone: "utc" }).setZone("Asia/Karachi");
+  const dt = DateTime.fromJSDate(sessionStart, { zone: "utc" }).setZone(
+    "Asia/Karachi"
+  );
   const hour = dt.hour;
   let shiftLabel = "General";
   let shiftDate = dt.startOf("day");
@@ -95,46 +81,27 @@ function assignShift(sessionStart) {
   };
 }
 
-/* =========================
-   Routes
-   ========================= */
-
-// Health check for Render
-app.get("/healthz", (_req, res) => res.send("ok"));
-
-// Root
-app.get("/", (_req, res) => {
-  res.send("✅ Employee Monitoring API is running...");
-});
-
-// Config (static)
-app.get("/config", (_req, res) => {
-  res.json({
-    generalIdleLimit: 60,
-    categoryColors: {
-      Official: "#3b82f6",
-      General: "#f59e0b",
-      Namaz: "#10b981",
-      AutoBreak: "#ef4444",
-    },
-  });
-});
-
-// Employees (main data)
-app.get("/employees", async (_req, res) => {
+// -------------------------
+// API Endpoint
+// -------------------------
+app.get("/employees", async (req, res) => {
   try {
     const users = await User.find();
     const settings = (await Settings.findOne()) || { general_idle_limit: 60 };
 
     const results = await Promise.all(
       users.map(async (u) => {
-        // Activity logs
-        const logs = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
+        // 🔹 Idle logs
+        const logs = await ActivityLog.find({ user: u.name }).sort({
+          timestamp: 1,
+        });
 
-        // AutoBreak logs
-        const abreaks = await AutoBreak.find({ user: u.name }).sort({ break_start: 1 });
+        // 🔹 AutoBreak logs
+        const abreaks = await AutoBreak.find({ user: u.name }).sort({
+          break_start: 1,
+        });
 
-        // Idle Sessions
+        // 🔹 Idle Sessions
         const idleSessions = logs
           .filter((log) => log.status === "Idle" && log.idle_start)
           .map((log) => {
@@ -153,10 +120,14 @@ app.get("/employees", async (_req, res) => {
               idle_start: start ? start.toISOString() : null,
               idle_end: end ? end.toISOString() : null,
               start_time_local: start
-                ? DateTime.fromJSDate(start, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+                ? DateTime.fromJSDate(start, { zone: "utc" })
+                    .setZone("Asia/Karachi")
+                    .toFormat("HH:mm:ss")
                 : "N/A",
               end_time_local: end
-                ? DateTime.fromJSDate(end, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+                ? DateTime.fromJSDate(end, { zone: "utc" })
+                    .setZone("Asia/Karachi")
+                    .toFormat("HH:mm:ss")
                 : "Ongoing",
               reason: log.reason,
               category: log.category,
@@ -166,20 +137,25 @@ app.get("/employees", async (_req, res) => {
             };
           });
 
-        // AutoBreak Sessions (merge)
+        // 🔹 AutoBreak Sessions (merged into idleSessions)
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end = br.break_end ? new Date(br.break_end) : null;
+
           const { shiftDate, shiftLabel } = assignShift(start);
 
           return {
             idle_start: start ? start.toISOString() : null,
             idle_end: end ? end.toISOString() : null,
             start_time_local: start
-              ? DateTime.fromJSDate(start, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+              ? DateTime.fromJSDate(start, { zone: "utc" })
+                  .setZone("Asia/Karachi")
+                  .toFormat("HH:mm:ss")
               : "N/A",
             end_time_local: end
-              ? DateTime.fromJSDate(end, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+              ? DateTime.fromJSDate(end, { zone: "utc" })
+                  .setZone("Asia/Karachi")
+                  .toFormat("HH:mm:ss")
               : "N/A",
             reason: "System Power Off / Startup",
             category: "AutoBreak",
@@ -196,8 +172,9 @@ app.get("/employees", async (_req, res) => {
           shift_start: u.shift_start,
           shift_end: u.shift_end,
           created_at: u.created_at,
-          latest_status: logs.length > 0 ? logs[logs.length - 1].status : "Unknown",
-          idle_sessions: [...idleSessions, ...autoBreaks],
+          latest_status:
+            logs.length > 0 ? logs[logs.length - 1].status : "Unknown",
+          idle_sessions: [...idleSessions, ...autoBreaks], // ✅ merge AutoBreaks with idle
         };
       })
     );
@@ -209,8 +186,25 @@ app.get("/employees", async (_req, res) => {
   }
 });
 
-/* =========================
-   Start server (Render)
-   ========================= */
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
+// ✅ Config endpoint
+app.get("/config", (req, res) => {
+  res.json({
+    generalIdleLimit: 60,
+    categoryColors: {
+      Official: "#3b82f6",
+      General: "#f59e0b",
+      Namaz: "#10b981",
+      AutoBreak: "#ef4444",
+    },
+  });
+});
+
+// Root
+app.get("/", (req, res) => {
+  res.send("✅ Employee Monitoring API is running...");
+});
+
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
