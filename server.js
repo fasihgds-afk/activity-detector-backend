@@ -8,9 +8,9 @@ const app = express();
 /* =========================
    CORS CONFIG
    ========================= */
-// Example value for testing: "http://localhost:3000,http://localhost:5173"
-// Later: add your deployed frontend URL (e.g. "https://your-frontend.vercel.app")
-const allowed = (process.env.CORS_ORIGIN || "*").split(",");
+// Example while testing: "http://localhost:3000,http://localhost:5173"
+// Later add your deployed frontend URL (e.g. "https://your-frontend.vercel.app")
+const allowed = (process.env.CORS_ORIGIN || "*").split(",").map(s => s.trim());
 app.use(cors({ origin: allowed, credentials: true }));
 
 app.use(express.json({ limit: "1mb" }));
@@ -18,15 +18,11 @@ app.use(express.json({ limit: "1mb" }));
 /* =========================
    MONGODB CONNECTION
    ========================= */
-// ⚠️ Make sure MONGODB_URI is set in Railway → Variables
 const mongoUri = process.env.MONGODB_URI;
 if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set. Configure it in Railway → Environment.");
 
 mongoose
-  .connect(mongoUri, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-  })
+  .connect(mongoUri, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err.message));
 
@@ -36,8 +32,8 @@ mongoose
 const userSchema = new mongoose.Schema({
   name: String,
   department: String,
-  shift_start: String,
-  shift_end: String,
+  shift_start: String, // e.g. "6 PM" or "18:00"
+  shift_end: String,   // e.g. "3 AM" or "03:00"
   created_at: Date,
 });
 
@@ -73,22 +69,64 @@ const Settings = mongoose.model("settings", settingsSchema);
 /* =========================
    HELPERS
    ========================= */
-function assignShift(sessionStart) {
-  if (!sessionStart) return { shiftDate: "Unknown", shiftLabel: "General" };
+const ZONE = "Asia/Karachi";
 
-  const dt = DateTime.fromJSDate(sessionStart, { zone: "utc" }).setZone("Asia/Karachi");
-  const hour = dt.hour;
-  let shiftLabel = "General";
-  let shiftDate = dt.startOf("day");
+function parseTimeToMinutes(str) {
+  if (!str) return null;
+  const s = String(str).replace(/[–—]/g, "-").trim(); // normalize dashes
+  const formats = ["h:mm a", "h a", "H:mm", "HH:mm"];
+  for (const f of formats) {
+    const dt = DateTime.fromFormat(s, f, { zone: ZONE });
+    if (dt.isValid) return dt.hour * 60 + dt.minute;
+  }
+  return null; // fallback will handle
+}
 
-  if (hour >= 18 && hour < 21) {
-    shiftLabel = "Shift 1 (6 PM – 3 AM)";
-  } else if (hour >= 21 || hour < 6) {
-    shiftLabel = "Shift 2 (9 PM – 6 AM)";
-    if (hour < 6) shiftDate = shiftDate.minus({ days: 1 });
+/**
+ * Compute the display label and "shift date" for a session, using the user's assigned shift.
+ * shiftDate = the business day the shift belongs to (handles overnight, e.g. 6 PM–3 AM).
+ */
+function assignShiftForUser(sessionStart, user) {
+  if (!sessionStart) {
+    return { shiftDate: "Unknown", shiftLabel: `${user.shift_start} – ${user.shift_end}` };
   }
 
-  return { shiftDate: shiftDate.toISODate(), shiftLabel };
+  const local = DateTime.fromJSDate(sessionStart, { zone: "utc" }).setZone(ZONE);
+  const minutesNow = local.hour * 60 + local.minute;
+
+  const startMin = parseTimeToMinutes(user.shift_start);
+  const endMin = parseTimeToMinutes(user.shift_end);
+
+  // Fallback to old heuristic if parsing failed
+  if (startMin == null || endMin == null) {
+    const hour = local.hour;
+    let label = "General";
+    let date = local.startOf("day");
+    if (hour >= 18 && hour < 21) {
+      label = "Shift 1 (6 PM – 3 AM)";
+    } else if (hour >= 21 || hour < 6) {
+      label = "Shift 2 (9 PM – 6 AM)";
+      if (hour < 6) date = date.minus({ days: 1 });
+    }
+    return { shiftDate: date.toISODate(), shiftLabel: label };
+  }
+
+  const crossesMidnight = endMin <= startMin;
+  let date = local.startOf("day");
+
+  if (crossesMidnight) {
+    // e.g. 18:00–03:00 ⇒ times between 00:00–02:59 belong to PREVIOUS day of shift
+    if (minutesNow < endMin) {
+      date = date.minus({ days: 1 });
+    }
+  } else {
+    // Same-day shift: nothing special to do
+  }
+
+  return {
+    shiftDate: date.toISODate(),
+    shiftLabel: `${user.shift_start} – ${user.shift_end}`,
+  };
 }
 
 /* =========================
@@ -122,6 +160,7 @@ app.get("/employees", async (_req, res) => {
         const logs = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
         const abreaks = await AutoBreak.find({ user: u.name }).sort({ break_start: 1 });
 
+        // Idle Sessions
         const idleSessions = logs
           .filter((log) => log.status === "Idle" && log.idle_start)
           .map((log) => {
@@ -134,44 +173,46 @@ app.get("/employees", async (_req, res) => {
                 : Math.max(0, Math.round((Date.now() - start) / 60000))
               : 0;
 
-            const { shiftDate, shiftLabel } = assignShift(start);
+            const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
 
             return {
               idle_start: start ? start.toISOString() : null,
               idle_end: end ? end.toISOString() : null,
               start_time_local: start
-                ? DateTime.fromJSDate(start, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+                ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
                 : "N/A",
               end_time_local: end
-                ? DateTime.fromJSDate(end, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+                ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
                 : "Ongoing",
               reason: log.reason,
               category: log.category,
               duration,
               shiftDate,
-              shiftLabel,
+              shiftLabel, // <- assigned shift label
             };
           });
 
+        // AutoBreak Sessions
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end = br.break_end ? new Date(br.break_end) : null;
-          const { shiftDate, shiftLabel } = assignShift(start);
+
+          const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
 
           return {
             idle_start: start ? start.toISOString() : null,
             idle_end: end ? end.toISOString() : null,
             start_time_local: start
-              ? DateTime.fromJSDate(start, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+              ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
               : "N/A",
             end_time_local: end
-              ? DateTime.fromJSDate(end, { zone: "utc" }).setZone("Asia/Karachi").toFormat("HH:mm:ss")
+              ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
               : "N/A",
             reason: "System Power Off / Startup",
             category: "AutoBreak",
             duration: br.duration_minutes,
             shiftDate,
-            shiftLabel,
+            shiftLabel, // <- assigned shift label
           };
         });
 
