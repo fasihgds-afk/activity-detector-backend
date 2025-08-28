@@ -31,6 +31,7 @@ mongoose
    ========================= */
 const userSchema = new mongoose.Schema({
   name: String,
+  emp_id: String, 
   department: String,
   shift_start: String, // e.g. "6 PM" or "18:00"
   shift_end: String,   // e.g. "3 AM" or "03:00"
@@ -218,6 +219,7 @@ app.get("/employees", async (_req, res) => {
 
         return {
           id: u._id,
+          emp_id: u.emp_id, 
           name: u.name,
           department: u.department,
           shift_start: u.shift_start,
