@@ -5,40 +5,33 @@ import { DateTime } from "luxon";
 
 const app = express();
 
-/* =========================
-   CORS CONFIG
-   ========================= */
+/* ============ CORS ============ */
 const allowed = (process.env.CORS_ORIGIN || "*").split(",").map(s => s.trim());
 app.use(cors({ origin: allowed, credentials: true }));
-
 app.use(express.json({ limit: "1mb" }));
 
-/* =========================
-   MONGODB CONNECTION
-   ========================= */
+/* ============ Mongo =========== */
 const mongoUri = process.env.MONGODB_URI;
-if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set. Configure it in Railway → Environment.");
+if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set.");
 
 mongoose
   .connect(mongoUri, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err.message));
 
-/* =========================
-   SCHEMAS & MODELS
-   ========================= */
+/* ============ Schemas ========== */
 const userSchema = new mongoose.Schema({
   name: String,
   emp_id: String,
   department: String,
-  shift_start: String, // "6:00 PM"
-  shift_end: String,   // "3:00 AM"
+  shift_start: String,
+  shift_end: String,
   created_at: Date,
 });
 
 const activitySchema = new mongoose.Schema({
   user: String,
-  status: String, // "Active" / "Idle"
+  status: String,
   reason: String,
   category: String,
   timestamp: Date,
@@ -52,23 +45,22 @@ const autoBreakSchema = new mongoose.Schema({
   break_start: Date,
   break_end: Date,
   duration_minutes: Number,
+  // some docs (from Python) also have: shiftDate, shiftLabel, break_start_local, break_end_local
   timestamp: { type: Date, default: Date.now },
 });
 
 const settingsSchema = new mongoose.Schema({
-  general_idle_limit: { type: Number, default: 60 }, // minutes
+  general_idle_limit: { type: Number, default: 60 },
   created_at: { type: Date, default: Date.now },
 });
 
-/*  IMPORTANT: pass the *collection name* as 3rd arg  */
+/* IMPORTANT: pass real collection names as 3rd arg */
 const User        = mongoose.model("User", userSchema, "users");
 const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs");
 const AutoBreak   = mongoose.model("AutoBreak", autoBreakSchema, "auto_break_logs");
 const Settings    = mongoose.model("Settings", settingsSchema, "settings");
 
-/* =========================
-   HELPERS
-   ========================= */
+/* ============ Helpers ========== */
 const ZONE = "Asia/Karachi";
 
 function parseTimeToMinutes(str) {
@@ -82,29 +74,21 @@ function parseTimeToMinutes(str) {
   return null;
 }
 
-/**
- * Assign shift date/label for a session using the user's assigned shift.
- * shiftDate = business day the shift belongs to (handles overnight).
- */
 function assignShiftForUser(sessionStart, user) {
   if (!sessionStart) {
     return { shiftDate: "Unknown", shiftLabel: `${user.shift_start} – ${user.shift_end}` };
   }
-
   const local = DateTime.fromJSDate(sessionStart, { zone: "utc" }).setZone(ZONE);
-  const minutesNow = local.hour * 60 + local.minute;
-
   const startMin = parseTimeToMinutes(user.shift_start);
   const endMin   = parseTimeToMinutes(user.shift_end);
 
   if (startMin == null || endMin == null) {
-    // Fallback heuristic if parsing fails
+    // Fallback heuristic
     const hour = local.hour;
     let label = "General";
     let date = local.startOf("day");
-    if (hour >= 18 && hour < 21) {
-      label = "Shift 1 (6 PM – 3 AM)";
-    } else if (hour >= 21 || hour < 6) {
+    if (hour >= 18 && hour < 21) label = "Shift 1 (6 PM – 3 AM)";
+    else if (hour >= 21 || hour < 6) {
       label = "Shift 2 (9 PM – 6 AM)";
       if (hour < 6) date = date.minus({ days: 1 });
     }
@@ -112,21 +96,15 @@ function assignShiftForUser(sessionStart, user) {
   }
 
   const crossesMidnight = endMin <= startMin;
+  const minutesNow = local.hour * 60 + local.minute;
   let date = local.startOf("day");
   if (crossesMidnight && minutesNow < endMin) {
-    // 18:00–03:00 ⇒ times between 00:00–02:59 belong to previous business day
     date = date.minus({ days: 1 });
   }
-
-  return {
-    shiftDate: date.toISODate(),
-    shiftLabel: `${user.shift_start} – ${user.shift_end}`,
-  };
+  return { shiftDate: date.toISODate(), shiftLabel: `${user.shift_start} – ${user.shift_end}` };
 }
 
-/* =========================
-   ROUTES
-   ========================= */
+/* ============ Routes =========== */
 app.get("/healthz", (_req, res) => res.send("ok"));
 
 app.get("/", (_req, res) => {
@@ -139,9 +117,9 @@ app.get("/config", (_req, res) => {
     namazLimit: 50,
     categoryColors: {
       Official: "#3b82f6",
-      General: "#f59e0b",
-      Namaz: "#10b981",
-      AutoBreak: "#ef4444",
+      General:  "#f59e0b",
+      Namaz:    "#10b981",
+      AutoBreak:"#ef4444",
     },
   });
 });
@@ -156,7 +134,7 @@ app.get("/employees", async (_req, res) => {
         const logs    = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
         const abreaks = await AutoBreak.find({ user: u.name }).sort({ break_start: 1 });
 
-        // Idle Sessions
+        // ----- Idle Sessions -----
         const idleSessions = logs
           .filter((log) => log.status === "Idle" && log.idle_start)
           .map((log) => {
@@ -173,7 +151,7 @@ app.get("/employees", async (_req, res) => {
 
             return {
               idle_start: start ? start.toISOString() : null,
-              idle_end: end ? end.toISOString() : null,
+              idle_end:   end ? end.toISOString() : null,
               start_time_local: start
                 ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
                 : "N/A",
@@ -188,15 +166,18 @@ app.get("/employees", async (_req, res) => {
             };
           });
 
-        // AutoBreak Sessions
+        // ----- AutoBreak Sessions -----
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end   = br.break_end ? new Date(br.break_end) : null;
 
-          const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
+          // Prefer Python-stored shiftDate/shiftLabel if present
+          const assigned = assignShiftForUser(start, u);
+          const shiftDate  = br.shiftDate  || assigned.shiftDate;
+          const shiftLabel = br.shiftLabel || assigned.shiftLabel;
 
-          // Use saved duration if present; else compute
-          let duration = typeof br.duration_minutes === "number" ? br.duration_minutes : null;
+          // Use saved duration if present; else compute; else 0
+          let duration = (typeof br.duration_minutes === "number") ? br.duration_minutes : null;
           if (duration == null && start && end) {
             duration = Math.round((end - start) / 60000);
           }
@@ -204,7 +185,7 @@ app.get("/employees", async (_req, res) => {
 
           return {
             idle_start: start ? start.toISOString() : null,
-            idle_end: end ? end.toISOString() : null,
+            idle_end:   end ? end.toISOString() : null,
             start_time_local: start
               ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
               : "N/A",
@@ -247,8 +228,7 @@ app.get("/employees", async (_req, res) => {
   }
 });
 
-/* =========================
-   START SERVER
-   ========================= */
+/* ============ Start ============ */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
+
