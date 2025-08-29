@@ -8,8 +8,6 @@ const app = express();
 /* =========================
    CORS CONFIG
    ========================= */
-// Example while testing: "http://localhost:3000,http://localhost:5173"
-// Later add your deployed frontend URL (e.g. "https://your-frontend.vercel.app")
 const allowed = (process.env.CORS_ORIGIN || "*").split(",").map(s => s.trim());
 app.use(cors({ origin: allowed, credentials: true }));
 
@@ -31,10 +29,10 @@ mongoose
    ========================= */
 const userSchema = new mongoose.Schema({
   name: String,
-  emp_id: String, 
+  emp_id: String,
   department: String,
-  shift_start: String, // e.g. "6 PM" or "18:00"
-  shift_end: String,   // e.g. "3 AM" or "03:00"
+  shift_start: String, // "6:00 PM"
+  shift_end: String,   // "3:00 AM"
   created_at: Date,
 });
 
@@ -62,10 +60,11 @@ const settingsSchema = new mongoose.Schema({
   created_at: { type: Date, default: Date.now },
 });
 
-const User = mongoose.model("users", userSchema);
-const ActivityLog = mongoose.model("activity_logs", activitySchema);
-const AutoBreak = mongoose.model("auto_break_logs", autoBreakSchema);
-const Settings = mongoose.model("settings", settingsSchema);
+/*  IMPORTANT: pass the *collection name* as 3rd arg  */
+const User        = mongoose.model("User", userSchema, "users");
+const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs");
+const AutoBreak   = mongoose.model("AutoBreak", autoBreakSchema, "auto_break_logs");
+const Settings    = mongoose.model("Settings", settingsSchema, "settings");
 
 /* =========================
    HELPERS
@@ -74,18 +73,18 @@ const ZONE = "Asia/Karachi";
 
 function parseTimeToMinutes(str) {
   if (!str) return null;
-  const s = String(str).replace(/[–—]/g, "-").trim(); // normalize dashes
+  const s = String(str).replace(/[–—]/g, "-").trim();
   const formats = ["h:mm a", "h a", "H:mm", "HH:mm"];
   for (const f of formats) {
     const dt = DateTime.fromFormat(s, f, { zone: ZONE });
     if (dt.isValid) return dt.hour * 60 + dt.minute;
   }
-  return null; // fallback will handle
+  return null;
 }
 
 /**
- * Compute the display label and "shift date" for a session, using the user's assigned shift.
- * shiftDate = the business day the shift belongs to (handles overnight, e.g. 6 PM–3 AM).
+ * Assign shift date/label for a session using the user's assigned shift.
+ * shiftDate = business day the shift belongs to (handles overnight).
  */
 function assignShiftForUser(sessionStart, user) {
   if (!sessionStart) {
@@ -96,10 +95,10 @@ function assignShiftForUser(sessionStart, user) {
   const minutesNow = local.hour * 60 + local.minute;
 
   const startMin = parseTimeToMinutes(user.shift_start);
-  const endMin = parseTimeToMinutes(user.shift_end);
+  const endMin   = parseTimeToMinutes(user.shift_end);
 
-  // Fallback to old heuristic if parsing failed
   if (startMin == null || endMin == null) {
+    // Fallback heuristic if parsing fails
     const hour = local.hour;
     let label = "General";
     let date = local.startOf("day");
@@ -114,14 +113,9 @@ function assignShiftForUser(sessionStart, user) {
 
   const crossesMidnight = endMin <= startMin;
   let date = local.startOf("day");
-
-  if (crossesMidnight) {
-    // e.g. 18:00–03:00 ⇒ times between 00:00–02:59 belong to PREVIOUS day of shift
-    if (minutesNow < endMin) {
-      date = date.minus({ days: 1 });
-    }
-  } else {
-    // Same-day shift: nothing special to do
+  if (crossesMidnight && minutesNow < endMin) {
+    // 18:00–03:00 ⇒ times between 00:00–02:59 belong to previous business day
+    date = date.minus({ days: 1 });
   }
 
   return {
@@ -142,6 +136,7 @@ app.get("/", (_req, res) => {
 app.get("/config", (_req, res) => {
   res.json({
     generalIdleLimit: 60,
+    namazLimit: 50,
     categoryColors: {
       Official: "#3b82f6",
       General: "#f59e0b",
@@ -158,7 +153,7 @@ app.get("/employees", async (_req, res) => {
 
     const results = await Promise.all(
       users.map(async (u) => {
-        const logs = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
+        const logs    = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
         const abreaks = await AutoBreak.find({ user: u.name }).sort({ break_start: 1 });
 
         // Idle Sessions
@@ -166,7 +161,7 @@ app.get("/employees", async (_req, res) => {
           .filter((log) => log.status === "Idle" && log.idle_start)
           .map((log) => {
             const start = log.idle_start ? new Date(log.idle_start) : null;
-            const end = log.idle_end ? new Date(log.idle_end) : null;
+            const end   = log.idle_end ? new Date(log.idle_end) : null;
 
             const duration = start
               ? end
@@ -189,16 +184,23 @@ app.get("/employees", async (_req, res) => {
               category: log.category,
               duration,
               shiftDate,
-              shiftLabel, // <- assigned shift label
+              shiftLabel,
             };
           });
 
         // AutoBreak Sessions
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
-          const end = br.break_end ? new Date(br.break_end) : null;
+          const end   = br.break_end ? new Date(br.break_end) : null;
 
           const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
+
+          // Use saved duration if present; else compute
+          let duration = typeof br.duration_minutes === "number" ? br.duration_minutes : null;
+          if (duration == null && start && end) {
+            duration = Math.round((end - start) / 60000);
+          }
+          if (duration == null) duration = 0;
 
           return {
             idle_start: start ? start.toISOString() : null,
@@ -211,22 +213,29 @@ app.get("/employees", async (_req, res) => {
               : "N/A",
             reason: "System Power Off / Startup",
             category: "AutoBreak",
-            duration: br.duration_minutes,
+            duration,
             shiftDate,
-            shiftLabel, // <- assigned shift label
+            shiftLabel,
           };
+        });
+
+        // Merge & sort by start time
+        const merged = [...idleSessions, ...autoBreaks].sort((a, b) => {
+          const at = a.idle_start ? new Date(a.idle_start).getTime() : 0;
+          const bt = b.idle_start ? new Date(b.idle_start).getTime() : 0;
+          return at - bt;
         });
 
         return {
           id: u._id,
-          emp_id: u.emp_id, 
+          emp_id: u.emp_id,
           name: u.name,
           department: u.department,
           shift_start: u.shift_start,
           shift_end: u.shift_end,
           created_at: u.created_at,
           latest_status: logs.length > 0 ? logs[logs.length - 1].status : "Unknown",
-          idle_sessions: [...idleSessions, ...autoBreaks],
+          idle_sessions: merged,
         };
       })
     );
