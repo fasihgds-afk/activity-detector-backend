@@ -24,16 +24,16 @@ const userSchema = new mongoose.Schema({
   name: String,
   emp_id: String,
   department: String,
-  shift_start: String,
-  shift_end: String,
+  shift_start: String, // e.g. "6:00 PM"
+  shift_end: String,   // e.g. "3:00 AM"
   created_at: Date,
 });
 
 const activitySchema = new mongoose.Schema({
   user: String,
-  status: String,
+  status: String,     // usually "Idle"
   reason: String,
-  category: String,
+  category: String,   // "Official" | "General" | "Namaz"
   timestamp: Date,
   idle_start: Date,
   idle_end: Date,
@@ -74,6 +74,18 @@ function parseTimeToMinutes(str) {
   return null;
 }
 
+function isInShiftNow(shiftStart, shiftEnd) {
+  const s = parseTimeToMinutes(shiftStart);
+  const e = parseTimeToMinutes(shiftEnd);
+  if (s == null || e == null) return false;
+
+  const now = DateTime.now().setZone(ZONE);
+  const m = now.hour * 60 + now.minute;
+  if (e >= s) return m >= s && m <= e;
+  // crosses midnight (e.g. 18:00–03:00)
+  return m >= s || m <= e;
+}
+
 function assignShiftForUser(sessionStart, user) {
   if (!sessionStart) {
     return { shiftDate: "Unknown", shiftLabel: `${user.shift_start} – ${user.shift_end}` };
@@ -102,6 +114,23 @@ function assignShiftForUser(sessionStart, user) {
     date = date.minus({ days: 1 });
   }
   return { shiftDate: date.toISODate(), shiftLabel: `${user.shift_start} – ${user.shift_end}` };
+}
+
+// Derive a better latest status from activity logs
+function deriveLatestStatus(logs) {
+  if (!Array.isArray(logs) || logs.length === 0) return "Unknown";
+
+  // If there is any ongoing Idle (no idle_end), the user is Idle
+  const ongoingIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start && !l.idle_end);
+  if (ongoingIdle) return "Idle";
+
+  // If the last Idle is closed (idle_end present), they're Active now
+  const lastIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start);
+  if (lastIdle && lastIdle.idle_end) return "Active";
+
+  // Else fall back to the very last record's status
+  const last = logs[logs.length - 1];
+  return last?.status || "Unknown";
 }
 
 /* ============ Routes =========== */
@@ -171,12 +200,10 @@ app.get("/employees", async (_req, res) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end   = br.break_end ? new Date(br.break_end) : null;
 
-          // Prefer Python-stored shiftDate/shiftLabel if present
-          const assigned = assignShiftForUser(start, u);
+          const assigned   = assignShiftForUser(start, u);
           const shiftDate  = br.shiftDate  || assigned.shiftDate;
           const shiftLabel = br.shiftLabel || assigned.shiftLabel;
 
-          // Use saved duration if present; else compute; else 0
           let duration = (typeof br.duration_minutes === "number") ? br.duration_minutes : null;
           if (duration == null && start && end) {
             duration = Math.round((end - start) / 60000);
@@ -207,6 +234,13 @@ app.get("/employees", async (_req, res) => {
           return at - bt;
         });
 
+        // Flags to help the UI
+        const hasOngoingIdle = logs.some(l => l.status === "Idle" && l.idle_start && !l.idle_end);
+        const hasOngoingAuto = abreaks.some(b => b.break_start && !b.break_end);
+
+        // Derive better latest status
+        const latestStatus = deriveLatestStatus(logs);
+
         return {
           id: u._id,
           emp_id: u.emp_id,
@@ -215,7 +249,12 @@ app.get("/employees", async (_req, res) => {
           shift_start: u.shift_start,
           shift_end: u.shift_end,
           created_at: u.created_at,
-          latest_status: logs.length > 0 ? logs[logs.length - 1].status : "Unknown",
+
+          latest_status: latestStatus,             // "Active" if last idle closed
+          has_ongoing_idle: hasOngoingIdle,        // boolean
+          has_ongoing_autobreak: hasOngoingAuto,   // boolean
+          is_in_shift_now: isInShiftNow(u.shift_start, u.shift_end),
+
           idle_sessions: merged,
         };
       })
@@ -231,4 +270,5 @@ app.get("/employees", async (_req, res) => {
 /* ============ Start ============ */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
+
 
