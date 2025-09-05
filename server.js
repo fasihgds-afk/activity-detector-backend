@@ -1,16 +1,29 @@
+// server.js
 import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
 import { DateTime } from "luxon";
 
+/* =========================
+   Basic App / Middleware
+   ========================= */
 const app = express();
 
-/* ============ CORS ============ */
-const allowed = (process.env.CORS_ORIGIN || "*").split(",").map(s => s.trim());
-app.use(cors({ origin: allowed, credentials: true }));
+const allowedOrigins = (process.env.CORS_ORIGIN || "*")
+  .split(",")
+  .map((s) => s.trim());
+
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 
-/* ============ Mongo =========== */
+/* =========================
+   MongoDB
+   ========================= */
 const mongoUri = process.env.MONGODB_URI;
 if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set.");
 
@@ -19,21 +32,23 @@ mongoose
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err.message));
 
-/* ============ Schemas ========== */
+/* =========================
+   Schemas / Models
+   ========================= */
 const userSchema = new mongoose.Schema({
   name: String,
   emp_id: String,
   department: String,
-  shift_start: String, // e.g. "6:00 PM"
-  shift_end: String,   // e.g. "3:00 AM"
+  shift_start: String, // e.g. "6:00 PM" or "18:00"
+  shift_end: String,   // e.g. "3:00 AM" or "03:00"
   created_at: Date,
 });
 
 const activitySchema = new mongoose.Schema({
   user: String,
-  status: String,     // usually "Idle"
+  status: String,      // usually "Idle"
   reason: String,
-  category: String,   // "Official" | "General" | "Namaz"
+  category: String,    // "Official" | "General" | "Namaz"
   timestamp: Date,
   idle_start: Date,
   idle_end: Date,
@@ -45,12 +60,17 @@ const autoBreakSchema = new mongoose.Schema({
   break_start: Date,
   break_end: Date,
   duration_minutes: Number,
-  // some docs (from Python) also have: shiftDate, shiftLabel, break_start_local, break_end_local
+  // optional precomputed fields from other ingesters:
+  shiftDate: String,
+  shiftLabel: String,
+  break_start_local: String,
+  break_end_local: String,
   timestamp: { type: Date, default: Date.now },
 });
 
 const settingsSchema = new mongoose.Schema({
   general_idle_limit: { type: Number, default: 60 },
+  namaz_limit: { type: Number, default: 50 },
   created_at: { type: Date, default: Date.now },
 });
 
@@ -60,7 +80,9 @@ const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs
 const AutoBreak   = mongoose.model("AutoBreak", autoBreakSchema, "auto_break_logs");
 const Settings    = mongoose.model("Settings", settingsSchema, "settings");
 
-/* ============ Helpers ========== */
+/* =========================
+   Helpers
+   ========================= */
 const ZONE = "Asia/Karachi";
 
 function parseTimeToMinutes(str) {
@@ -82,7 +104,7 @@ function isInShiftNow(shiftStart, shiftEnd) {
   const now = DateTime.now().setZone(ZONE);
   const m = now.hour * 60 + now.minute;
   if (e >= s) return m >= s && m <= e;
-  return m >= s || m <= e;
+  return m >= s || m <= e; // crosses midnight
 }
 
 function assignShiftForUser(sessionStart, user) {
@@ -116,51 +138,78 @@ function assignShiftForUser(sessionStart, user) {
 
 function deriveLatestStatus(logs) {
   if (!Array.isArray(logs) || logs.length === 0) return "Unknown";
+
+  // If there is any ongoing Idle (no idle_end), the user is Idle
   const ongoingIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start && !l.idle_end);
   if (ongoingIdle) return "Idle";
+
+  // If the last Idle is closed (idle_end present), they're Active now
   const lastIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start);
   if (lastIdle && lastIdle.idle_end) return "Active";
+
+  // Else fall back to the very last record's status
   const last = logs[logs.length - 1];
   return last?.status || "Unknown";
 }
 
-/* ============ Health & Gate =========== */
+/* =========================
+   Health & Gate
+   ========================= */
 app.get("/healthz", (_req, res) => res.send("ok"));
 app.get("/", (_req, res) => res.send("✅ Employee Monitoring API is running..."));
 
 /**
- * GATE for frontend buttons — must return 200 OK if updates are allowed WITHOUT redirect.
- * If you need auth, implement it here; otherwise keep it simple OK.
+ * Gate used by the frontend to decide whether to show Update/Delete buttons.
+ * Keep it 2xx and non-redirect when updates are allowed.
  */
 app.get("/update", (_req, res) => {
   res.status(200).json({ ok: true });
 });
 
-/* ============ Config =========== */
-app.get("/config", (_req, res) => {
-  res.json({
-    generalIdleLimit: 60,
-    namazLimit: 50,
-    categoryColors: {
-      Official: "#3b82f6",
-      General:  "#f59e0b",
-      Namaz:    "#10b981",
-      AutoBreak:"#ef4444",
-    },
-  });
+/* =========================
+   Config
+   ========================= */
+app.get("/config", async (_req, res) => {
+  try {
+    const s = (await Settings.findOne()) || { general_idle_limit: 60, namaz_limit: 50 };
+    res.json({
+      generalIdleLimit: s.general_idle_limit ?? 60,
+      namazLimit: s.namaz_limit ?? 50,
+      categoryColors: {
+        Official: "#3b82f6",
+        General:  "#f59e0b",
+        Namaz:    "#10b981",
+        AutoBreak:"#ef4444",
+      },
+    });
+  } catch (e) {
+    res.json({
+      generalIdleLimit: 60,
+      namazLimit: 50,
+      categoryColors: {
+        Official: "#3b82f6",
+        General:  "#f59e0b",
+        Namaz:    "#10b981",
+        AutoBreak:"#ef4444",
+      },
+    });
+  }
 });
 
-/* ============ Employees (read) =========== */
+/* =========================
+   Employees (READ)
+   ========================= */
 app.get("/employees", async (_req, res) => {
   try {
     const users = await User.find();
-    const settings = (await Settings.findOne()) || { general_idle_limit: 60 };
+    const settings = (await Settings.findOne()) || { general_idle_limit: 60, namaz_limit: 50 };
 
     const results = await Promise.all(
       users.map(async (u) => {
         const logs    = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
         const abreaks = await AutoBreak.find({ user: u.name }).sort({ break_start: 1 });
 
+        // ----- Idle Sessions from ActivityLogs -----
         const idleSessions = logs
           .filter((log) => log.status === "Idle" && log.idle_start)
           .map((log) => {
@@ -176,6 +225,8 @@ app.get("/employees", async (_req, res) => {
             const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
 
             return {
+              _id: log._id,             // IMPORTANT for editing
+              kind: "Idle",
               idle_start: start ? start.toISOString() : null,
               idle_end:   end ? end.toISOString() : null,
               start_time_local: start
@@ -192,6 +243,7 @@ app.get("/employees", async (_req, res) => {
             };
           });
 
+        // ----- AutoBreak Sessions -----
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end   = br.break_end ? new Date(br.break_end) : null;
@@ -200,13 +252,15 @@ app.get("/employees", async (_req, res) => {
           const shiftDate  = br.shiftDate  || assigned.shiftDate;
           const shiftLabel = br.shiftLabel || assigned.shiftLabel;
 
-          let duration = (typeof br.duration_minutes === "number") ? br.duration_minutes : null;
+          let duration = typeof br.duration_minutes === "number" ? br.duration_minutes : null;
           if (duration == null && start && end) {
             duration = Math.round((end - start) / 60000);
           }
           if (duration == null) duration = 0;
 
           return {
+            _id: br._id,               // IMPORTANT for closing
+            kind: "AutoBreak",
             idle_start: start ? start.toISOString() : null,
             idle_end:   end ? end.toISOString() : null,
             start_time_local: start
@@ -214,7 +268,7 @@ app.get("/employees", async (_req, res) => {
               : "N/A",
             end_time_local: end
               ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
-              : "N/A",
+              : end ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss") : "N/A",
             reason: "System Power Off / Startup",
             category: "AutoBreak",
             duration,
@@ -223,14 +277,18 @@ app.get("/employees", async (_req, res) => {
           };
         });
 
+        // Merge & sort
         const merged = [...idleSessions, ...autoBreaks].sort((a, b) => {
           const at = a.idle_start ? new Date(a.idle_start).getTime() : 0;
           const bt = b.idle_start ? new Date(b.idle_start).getTime() : 0;
           return at - bt;
         });
 
+        // Flags to help the UI
         const hasOngoingIdle = logs.some(l => l.status === "Idle" && l.idle_start && !l.idle_end);
         const hasOngoingAuto = abreaks.some(b => b.break_start && !b.break_end);
+
+        // Derive better latest status
         const latestStatus = deriveLatestStatus(logs);
 
         return {
@@ -259,7 +317,9 @@ app.get("/employees", async (_req, res) => {
   }
 });
 
-/* ============ Employees (update) =========== */
+/* =========================
+   Employees (UPDATE / DELETE)
+   ========================= */
 app.put("/employees/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -271,10 +331,15 @@ app.put("/employees/:id", async (req, res) => {
     if (typeof shift_end === "string") update.shift_end = shift_end;
 
     // allow either Mongo _id or emp_id
-    const byId = await User.findById(id).exec().catch(() => null);
-    const doc = byId
-      ? await User.findByIdAndUpdate(id, update, { new: true })
-      : await User.findOneAndUpdate({ emp_id: id }, update, { new: true });
+    let doc = null;
+    try {
+      doc = await User.findByIdAndUpdate(id, update, { new: true });
+    } catch (_) {
+      // ignore ObjectId cast errors
+    }
+    if (!doc) {
+      doc = await User.findOneAndUpdate({ emp_id: id }, update, { new: true });
+    }
 
     if (!doc) return res.status(404).json({ error: "Employee not found" });
     res.json({ ok: true, employee: doc });
@@ -284,16 +349,20 @@ app.put("/employees/:id", async (req, res) => {
   }
 });
 
-/* ============ Employees (delete) =========== */
 app.delete("/employees/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
     // allow either Mongo _id or emp_id
-    const byId = await User.findById(id).exec().catch(() => null);
-    const result = byId
-      ? await User.findByIdAndDelete(id)
-      : await User.findOneAndDelete({ emp_id: id });
+    let result = null;
+    try {
+      result = await User.findByIdAndDelete(id);
+    } catch (_) {
+      // ignore cast errors
+    }
+    if (!result) {
+      result = await User.findOneAndDelete({ emp_id: id });
+    }
 
     if (!result) return res.status(404).json({ error: "Employee not found" });
     res.json({ ok: true });
@@ -303,6 +372,87 @@ app.delete("/employees/:id", async (req, res) => {
   }
 });
 
-/* ============ Start ============ */
+/* =========================
+   Activity Logs (UPDATE reason/category)
+   ========================= */
+app.put("/activities/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason, category, status, idle_start, idle_end } = req.body || {};
+
+    const update = {};
+    if (typeof reason === "string") update.reason = reason;
+    if (typeof category === "string") update.category = category;
+    if (typeof status === "string") update.status = status;
+    if (idle_start) update.idle_start = new Date(idle_start);
+    if (idle_end) update.idle_end = new Date(idle_end);
+
+    const updated = await ActivityLog.findByIdAndUpdate(id, update, { new: true });
+    if (!updated) return res.status(404).json({ error: "Log not found" });
+    res.json({ ok: true, log: updated });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update activity log" });
+  }
+});
+
+/* Close an ongoing Idle activity NOW (set idle_end = now) */
+app.put("/activities/:id/end", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const log = await ActivityLog.findById(id);
+    if (!log) return res.status(404).json({ error: "Log not found" });
+
+    if (!log.idle_start) return res.status(400).json({ error: "Log has no idle_start" });
+    if (log.idle_end) return res.status(400).json({ error: "Log already closed" });
+
+    log.idle_end = new Date();
+    await log.save();
+    res.json({ ok: true, log });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to close activity log" });
+  }
+});
+
+/* =========================
+   AutoBreaks (CLOSE NOW)
+   ========================= */
+app.put("/autobreaks/:id/end", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const br = await AutoBreak.findById(id);
+    if (!br) return res.status(404).json({ error: "AutoBreak not found" });
+
+    if (!br.break_start) return res.status(400).json({ error: "AutoBreak has no break_start" });
+    if (br.break_end) return res.status(400).json({ error: "AutoBreak already closed" });
+
+    const now = new Date();
+    br.break_end = now;
+    br.duration_minutes = Math.max(0, Math.round((now - br.break_start) / 60000));
+    await br.save();
+    res.json({ ok: true, autoBreak: br });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to close autobreak" });
+  }
+});
+
+/* (optional) delete an activity log */
+app.delete("/activities/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = await ActivityLog.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ error: "Log not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete activity log" });
+  }
+});
+
+/* =========================
+   Start Server
+   ========================= */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
