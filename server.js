@@ -250,9 +250,9 @@ app.get("/employees", async (_req, res) => {
           shift_end: u.shift_end,
           created_at: u.created_at,
 
-          latest_status: latestStatus,             // "Active" if last idle closed
-          has_ongoing_idle: hasOngoingIdle,        // boolean
-          has_ongoing_autobreak: hasOngoingAuto,   // boolean
+          latest_status: latestStatus,
+          has_ongoing_idle: hasOngoingIdle,
+          has_ongoing_autobreak: hasOngoingAuto,
           is_in_shift_now: isInShiftNow(u.shift_start, u.shift_end),
 
           idle_sessions: merged,
@@ -267,8 +267,63 @@ app.get("/employees", async (_req, res) => {
   }
 });
 
+/* ========= NEW: helpers to resolve ID (emp_id or _id) ========= */
+function isMongoId(s) {
+  return /^[0-9a-fA-F]{24}$/.test(String(s || ""));
+}
+async function findUserByAnyId(id) {
+  if (!id) return null;
+  if (isMongoId(id)) {
+    const byMongo = await User.findById(id);
+    if (byMongo) return byMongo;
+  }
+  return await User.findOne({ emp_id: id });
+}
+
+/* ========= NEW: UPDATE employee =========
+   PUT /employees/:id
+   Body: { name?, department?, shift_start?, shift_end? }
+*/
+app.put("/employees/:id", async (req, res) => {
+  try {
+    const u = await findUserByAnyId(req.params.id);
+    if (!u) return res.status(404).json({ error: "Employee not found" });
+
+    const { name, department, shift_start, shift_end } = req.body || {};
+
+    if (typeof name === "string") u.name = name.trim();
+    if (typeof department === "string") u.department = department.trim();
+    if (typeof shift_start === "string") u.shift_start = shift_start.trim();
+    if (typeof shift_end === "string") u.shift_end = shift_end.trim();
+
+    await u.save();
+    return res.json({ ok: true, employee: u });
+  } catch (e) {
+    console.error("Update error:", e);
+    return res.status(500).json({ error: "Update failed" });
+  }
+});
+
+/* ========= NEW: DELETE employee =========
+   DELETE /employees/:id
+*/
+app.delete("/employees/:id", async (req, res) => {
+  try {
+    const u = await findUserByAnyId(req.params.id);
+    if (!u) return res.status(404).json({ error: "Employee not found" });
+
+    await User.deleteOne({ _id: u._id });
+    // Optional: also clean related logs if you want hard-delete
+    // await ActivityLog.deleteMany({ user: u.name });
+    // await AutoBreak.deleteMany({ user: u.name });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("Delete error:", e);
+    return res.status(500).json({ error: "Delete failed" });
+  }
+});
+
 /* ============ Start ============ */
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
-
-
