@@ -60,7 +60,7 @@ const autoBreakSchema = new mongoose.Schema({
   break_start: Date,
   break_end: Date,
   duration_minutes: Number,
-  // optional precomputed fields from other ingesters:
+  // optional fields from other ingesters
   shiftDate: String,
   shiftLabel: String,
   break_start_local: String,
@@ -139,15 +139,12 @@ function assignShiftForUser(sessionStart, user) {
 function deriveLatestStatus(logs) {
   if (!Array.isArray(logs) || logs.length === 0) return "Unknown";
 
-  // If there is any ongoing Idle (no idle_end), the user is Idle
   const ongoingIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start && !l.idle_end);
   if (ongoingIdle) return "Idle";
 
-  // If the last Idle is closed (idle_end present), they're Active now
   const lastIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start);
   if (lastIdle && lastIdle.idle_end) return "Active";
 
-  // Else fall back to the very last record's status
   const last = logs[logs.length - 1];
   return last?.status || "Unknown";
 }
@@ -225,7 +222,7 @@ app.get("/employees", async (_req, res) => {
             const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
 
             return {
-              _id: log._id,             // IMPORTANT for editing
+              _id: log._id,
               kind: "Idle",
               idle_start: start ? start.toISOString() : null,
               idle_end:   end ? end.toISOString() : null,
@@ -259,7 +256,7 @@ app.get("/employees", async (_req, res) => {
           if (duration == null) duration = 0;
 
           return {
-            _id: br._id,               // IMPORTANT for closing
+            _id: br._id,
             kind: "AutoBreak",
             idle_start: start ? start.toISOString() : null,
             idle_end:   end ? end.toISOString() : null,
@@ -268,7 +265,7 @@ app.get("/employees", async (_req, res) => {
               : "N/A",
             end_time_local: end
               ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
-              : end ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss") : "N/A",
+              : "N/A",
             reason: "System Power Off / Startup",
             category: "AutoBreak",
             duration,
@@ -334,12 +331,8 @@ app.put("/employees/:id", async (req, res) => {
     let doc = null;
     try {
       doc = await User.findByIdAndUpdate(id, update, { new: true });
-    } catch (_) {
-      // ignore ObjectId cast errors
-    }
-    if (!doc) {
-      doc = await User.findOneAndUpdate({ emp_id: id }, update, { new: true });
-    }
+    } catch (_) { /* ignore cast errors */ }
+    if (!doc) doc = await User.findOneAndUpdate({ emp_id: id }, update, { new: true });
 
     if (!doc) return res.status(404).json({ error: "Employee not found" });
     res.json({ ok: true, employee: doc });
@@ -353,16 +346,11 @@ app.delete("/employees/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // allow either Mongo _id or emp_id
     let result = null;
     try {
       result = await User.findByIdAndDelete(id);
-    } catch (_) {
-      // ignore cast errors
-    }
-    if (!result) {
-      result = await User.findOneAndDelete({ emp_id: id });
-    }
+    } catch (_) { /* ignore cast errors */ }
+    if (!result) result = await User.findOneAndDelete({ emp_id: id });
 
     if (!result) return res.status(404).json({ error: "Employee not found" });
     res.json({ ok: true });
@@ -373,7 +361,7 @@ app.delete("/employees/:id", async (req, res) => {
 });
 
 /* =========================
-   Activity Logs (UPDATE reason/category)
+   Activity Logs (UPDATE time/reason/category)
    ========================= */
 app.put("/activities/:id", async (req, res) => {
   try {
@@ -384,12 +372,40 @@ app.put("/activities/:id", async (req, res) => {
     if (typeof reason === "string") update.reason = reason;
     if (typeof category === "string") update.category = category;
     if (typeof status === "string") update.status = status;
-    if (idle_start) update.idle_start = new Date(idle_start);
-    if (idle_end) update.idle_end = new Date(idle_end);
+    if (idle_start) {
+      const d = new Date(idle_start);
+      if (isNaN(d.getTime())) return res.status(400).json({ error: "Invalid idle_start" });
+      update.idle_start = d;
+    }
+    if (idle_end !== undefined) {
+      if (idle_end === null || idle_end === "") {
+        update.idle_end = undefined; // will unset below
+      } else {
+        const d2 = new Date(idle_end);
+        if (isNaN(d2.getTime())) return res.status(400).json({ error: "Invalid idle_end" });
+        update.idle_end = d2;
+      }
+    }
 
-    const updated = await ActivityLog.findByIdAndUpdate(id, update, { new: true });
-    if (!updated) return res.status(404).json({ error: "Log not found" });
-    res.json({ ok: true, log: updated });
+    // Use findById first
+    let doc = await ActivityLog.findById(id);
+    if (!doc) return res.status(404).json({ error: "Log not found" });
+
+    if (update.reason !== undefined) doc.reason = update.reason;
+    if (update.category !== undefined) doc.category = update.category;
+    if (update.status !== undefined) doc.status = update.status;
+    if (update.idle_start !== undefined) doc.idle_start = update.idle_start;
+
+    if (idle_end !== undefined) {
+      if (idle_end === null || idle_end === "") {
+        doc.idle_end = undefined; // make it ongoing
+      } else {
+        doc.idle_end = update.idle_end;
+      }
+    }
+
+    await doc.save();
+    res.json({ ok: true, log: doc });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update activity log" });
