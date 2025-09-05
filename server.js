@@ -82,7 +82,6 @@ function isInShiftNow(shiftStart, shiftEnd) {
   const now = DateTime.now().setZone(ZONE);
   const m = now.hour * 60 + now.minute;
   if (e >= s) return m >= s && m <= e;
-  // crosses midnight (e.g. 18:00–03:00)
   return m >= s || m <= e;
 }
 
@@ -95,7 +94,6 @@ function assignShiftForUser(sessionStart, user) {
   const endMin   = parseTimeToMinutes(user.shift_end);
 
   if (startMin == null || endMin == null) {
-    // Fallback heuristic
     const hour = local.hour;
     let label = "General";
     let date = local.startOf("day");
@@ -116,30 +114,29 @@ function assignShiftForUser(sessionStart, user) {
   return { shiftDate: date.toISODate(), shiftLabel: `${user.shift_start} – ${user.shift_end}` };
 }
 
-// Derive a better latest status from activity logs
 function deriveLatestStatus(logs) {
   if (!Array.isArray(logs) || logs.length === 0) return "Unknown";
-
-  // If there is any ongoing Idle (no idle_end), the user is Idle
   const ongoingIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start && !l.idle_end);
   if (ongoingIdle) return "Idle";
-
-  // If the last Idle is closed (idle_end present), they're Active now
   const lastIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start);
   if (lastIdle && lastIdle.idle_end) return "Active";
-
-  // Else fall back to the very last record's status
   const last = logs[logs.length - 1];
   return last?.status || "Unknown";
 }
 
-/* ============ Routes =========== */
+/* ============ Health & Gate =========== */
 app.get("/healthz", (_req, res) => res.send("ok"));
+app.get("/", (_req, res) => res.send("✅ Employee Monitoring API is running..."));
 
-app.get("/", (_req, res) => {
-  res.send("✅ Employee Monitoring API is running...");
+/**
+ * GATE for frontend buttons — must return 200 OK if updates are allowed WITHOUT redirect.
+ * If you need auth, implement it here; otherwise keep it simple OK.
+ */
+app.get("/update", (_req, res) => {
+  res.status(200).json({ ok: true });
 });
 
+/* ============ Config =========== */
 app.get("/config", (_req, res) => {
   res.json({
     generalIdleLimit: 60,
@@ -153,6 +150,7 @@ app.get("/config", (_req, res) => {
   });
 });
 
+/* ============ Employees (read) =========== */
 app.get("/employees", async (_req, res) => {
   try {
     const users = await User.find();
@@ -163,7 +161,6 @@ app.get("/employees", async (_req, res) => {
         const logs    = await ActivityLog.find({ user: u.name }).sort({ timestamp: 1 });
         const abreaks = await AutoBreak.find({ user: u.name }).sort({ break_start: 1 });
 
-        // ----- Idle Sessions -----
         const idleSessions = logs
           .filter((log) => log.status === "Idle" && log.idle_start)
           .map((log) => {
@@ -195,7 +192,6 @@ app.get("/employees", async (_req, res) => {
             };
           });
 
-        // ----- AutoBreak Sessions -----
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end   = br.break_end ? new Date(br.break_end) : null;
@@ -227,18 +223,14 @@ app.get("/employees", async (_req, res) => {
           };
         });
 
-        // Merge & sort by start time
         const merged = [...idleSessions, ...autoBreaks].sort((a, b) => {
           const at = a.idle_start ? new Date(a.idle_start).getTime() : 0;
           const bt = b.idle_start ? new Date(b.idle_start).getTime() : 0;
           return at - bt;
         });
 
-        // Flags to help the UI
         const hasOngoingIdle = logs.some(l => l.status === "Idle" && l.idle_start && !l.idle_end);
         const hasOngoingAuto = abreaks.some(b => b.break_start && !b.break_end);
-
-        // Derive better latest status
         const latestStatus = deriveLatestStatus(logs);
 
         return {
@@ -267,60 +259,47 @@ app.get("/employees", async (_req, res) => {
   }
 });
 
-/* ========= NEW: helpers to resolve ID (emp_id or _id) ========= */
-function isMongoId(s) {
-  return /^[0-9a-fA-F]{24}$/.test(String(s || ""));
-}
-async function findUserByAnyId(id) {
-  if (!id) return null;
-  if (isMongoId(id)) {
-    const byMongo = await User.findById(id);
-    if (byMongo) return byMongo;
-  }
-  return await User.findOne({ emp_id: id });
-}
-
-/* ========= NEW: UPDATE employee =========
-   PUT /employees/:id
-   Body: { name?, department?, shift_start?, shift_end? }
-*/
+/* ============ Employees (update) =========== */
 app.put("/employees/:id", async (req, res) => {
   try {
-    const u = await findUserByAnyId(req.params.id);
-    if (!u) return res.status(404).json({ error: "Employee not found" });
-
+    const { id } = req.params;
     const { name, department, shift_start, shift_end } = req.body || {};
+    const update = {};
+    if (typeof name === "string") update.name = name;
+    if (typeof department === "string") update.department = department;
+    if (typeof shift_start === "string") update.shift_start = shift_start;
+    if (typeof shift_end === "string") update.shift_end = shift_end;
 
-    if (typeof name === "string") u.name = name.trim();
-    if (typeof department === "string") u.department = department.trim();
-    if (typeof shift_start === "string") u.shift_start = shift_start.trim();
-    if (typeof shift_end === "string") u.shift_end = shift_end.trim();
+    // allow either Mongo _id or emp_id
+    const byId = await User.findById(id).exec().catch(() => null);
+    const doc = byId
+      ? await User.findByIdAndUpdate(id, update, { new: true })
+      : await User.findOneAndUpdate({ emp_id: id }, update, { new: true });
 
-    await u.save();
-    return res.json({ ok: true, employee: u });
+    if (!doc) return res.status(404).json({ error: "Employee not found" });
+    res.json({ ok: true, employee: doc });
   } catch (e) {
-    console.error("Update error:", e);
-    return res.status(500).json({ error: "Update failed" });
+    console.error(e);
+    res.status(500).json({ error: "Failed to update employee" });
   }
 });
 
-/* ========= NEW: DELETE employee =========
-   DELETE /employees/:id
-*/
+/* ============ Employees (delete) =========== */
 app.delete("/employees/:id", async (req, res) => {
   try {
-    const u = await findUserByAnyId(req.params.id);
-    if (!u) return res.status(404).json({ error: "Employee not found" });
+    const { id } = req.params;
 
-    await User.deleteOne({ _id: u._id });
-    // Optional: also clean related logs if you want hard-delete
-    // await ActivityLog.deleteMany({ user: u.name });
-    // await AutoBreak.deleteMany({ user: u.name });
+    // allow either Mongo _id or emp_id
+    const byId = await User.findById(id).exec().catch(() => null);
+    const result = byId
+      ? await User.findByIdAndDelete(id)
+      : await User.findOneAndDelete({ emp_id: id });
 
-    return res.json({ ok: true });
+    if (!result) return res.status(404).json({ error: "Employee not found" });
+    res.json({ ok: true });
   } catch (e) {
-    console.error("Delete error:", e);
-    return res.status(500).json({ error: "Delete failed" });
+    console.error(e);
+    res.status(500).json({ error: "Failed to delete employee" });
   }
 });
 
