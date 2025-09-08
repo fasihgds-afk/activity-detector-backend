@@ -5,23 +5,28 @@ import mongoose from "mongoose";
 import { DateTime } from "luxon";
 
 /* =========================
-   Basic App / Middleware
+   App + Middleware
    ========================= */
 const app = express();
 
-// kill implicit ETag → avoids slow 304 roundtrips on /employees
+// Avoid slow 304 revalidation paths
 app.set("etag", false);
+
+// Simple latency logging (keep it)
+app.use((req, res, next) => {
+  const t0 = process.hrtime.bigint();
+  res.on("finish", () => {
+    const ms = Number((process.hrtime.bigint() - t0) / 1000000n);
+    console.log(`${req.method} ${req.originalUrl} -> ${res.statusCode} in ${ms}ms`);
+  });
+  next();
+});
 
 const allowedOrigins = (process.env.CORS_ORIGIN || "*")
   .split(",")
   .map((s) => s.trim());
 
-app.use(
-  cors({
-    origin: allowedOrigins,
-    credentials: true,
-  })
-);
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json({ limit: "1mb" }));
 
 /* =========================
@@ -30,36 +35,36 @@ app.use(express.json({ limit: "1mb" }));
 const mongoUri = process.env.MONGODB_URI;
 if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set.");
 
+// allow building indexes when env says so (production disables by default)
+mongoose.set("autoIndex", process.env.MONGOOSE_AUTO_INDEX === "true");
+
 mongoose
   .connect(mongoUri, {
-    // modern driver options; pooling helps under burst
-    maxPoolSize: 15,
+    maxPoolSize: 15, // healthy pool
   })
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err.message));
 
 /* =========================
-   Schemas / Models
+   Schemas / Models + Indexes
    ========================= */
 const userSchema = new mongoose.Schema({
   name: String,
   emp_id: String,
   department: String,
-  shift_start: String, // "6:00 PM" or "18:00"
-  shift_end: String,   // "3:00 AM" or "03:00"
+  shift_start: String,
+  shift_end: String,
   created_at: Date,
 });
-
 const activitySchema = new mongoose.Schema({
   user: String,
-  status: String,      // typically "Idle"
+  status: String,
   reason: String,
-  category: String,    // "Official" | "General" | "Namaz"
+  category: String,
   timestamp: Date,
   idle_start: Date,
   idle_end: Date,
 });
-
 const autoBreakSchema = new mongoose.Schema({
   user: String,
   status: { type: String, default: "AutoBreak" },
@@ -72,29 +77,44 @@ const autoBreakSchema = new mongoose.Schema({
   break_end_local: String,
   timestamp: { type: Date, default: Date.now },
 });
-
 const settingsSchema = new mongoose.Schema({
   general_idle_limit: { type: Number, default: 60 },
   namaz_limit: { type: Number, default: 50 },
   created_at: { type: Date, default: Date.now },
 });
 
-/* 🔥 Indexes: make the hot queries fast */
+// 🔥 indexes for fast lookups/sorts
 userSchema.index({ emp_id: 1 });
 userSchema.index({ name: 1 });
-
 activitySchema.index({ user: 1, timestamp: 1 });
 activitySchema.index({ user: 1, idle_start: 1 });
 activitySchema.index({ user: 1, idle_end: 1 });
-
 autoBreakSchema.index({ user: 1, break_start: 1 });
 autoBreakSchema.index({ user: 1, break_end: 1 });
 
-/* IMPORTANT: pass real collection names as 3rd arg */
+/* IMPORTANT: explicit collection names */
 const User        = mongoose.model("User", userSchema, "users");
 const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs");
 const AutoBreak   = mongoose.model("AutoBreak", autoBreakSchema, "auto_break_logs");
 const Settings    = mongoose.model("Settings", settingsSchema, "settings");
+
+/* Build indexes once when env flag set */
+async function maybeSyncIndexes() {
+  if (process.env.SYNC_INDEXES === "true") {
+    console.time("syncIndexes");
+    await Promise.all([
+      User.syncIndexes(),
+      ActivityLog.syncIndexes(),
+      AutoBreak.syncIndexes(),
+      Settings.syncIndexes(),
+    ]);
+    console.timeEnd("syncIndexes");
+    console.log("✅ Indexes synced");
+  } else {
+    console.log("ℹ️ Skipping syncIndexes (set SYNC_INDEXES=true to run once)");
+  }
+}
+maybeSyncIndexes().catch((e) => console.error("syncIndexes error", e));
 
 /* =========================
    Helpers
@@ -111,26 +131,20 @@ function parseTimeToMinutes(str) {
   }
   return null;
 }
-
 function isInShiftNow(shiftStart, shiftEnd) {
   const s = parseTimeToMinutes(shiftStart);
   const e = parseTimeToMinutes(shiftEnd);
   if (s == null || e == null) return false;
-
   const now = DateTime.now().setZone(ZONE);
   const m = now.hour * 60 + now.minute;
   if (e >= s) return m >= s && m <= e;
   return m >= s || m <= e; // crosses midnight
 }
-
 function assignShiftForUser(sessionStart, user) {
-  if (!sessionStart) {
-    return { shiftDate: "Unknown", shiftLabel: `${user.shift_start} – ${user.shift_end}` };
-  }
+  if (!sessionStart) return { shiftDate: "Unknown", shiftLabel: `${user.shift_start} – ${user.shift_end}` };
   const local = DateTime.fromJSDate(sessionStart, { zone: "utc" }).setZone(ZONE);
   const startMin = parseTimeToMinutes(user.shift_start);
   const endMin   = parseTimeToMinutes(user.shift_end);
-
   if (startMin == null || endMin == null) {
     const hour = local.hour;
     let label = "General";
@@ -142,16 +156,12 @@ function assignShiftForUser(sessionStart, user) {
     }
     return { shiftDate: date.toISODate(), shiftLabel: label };
   }
-
   const crossesMidnight = endMin <= startMin;
   const minutesNow = local.hour * 60 + local.minute;
   let date = local.startOf("day");
-  if (crossesMidnight && minutesNow < endMin) {
-    date = date.minus({ days: 1 });
-  }
+  if (crossesMidnight && minutesNow < endMin) date = date.minus({ days: 1 });
   return { shiftDate: date.toISODate(), shiftLabel: `${user.shift_start} – ${user.shift_end}` };
 }
-
 function deriveLatestStatus(logs) {
   if (!Array.isArray(logs) || logs.length === 0) return "Unknown";
   const ongoingIdle = [...logs].reverse().find(l => l.status === "Idle" && l.idle_start && !l.idle_end);
@@ -167,11 +177,7 @@ function deriveLatestStatus(logs) {
    ========================= */
 app.get("/healthz", (_req, res) => res.send("ok"));
 app.get("/", (_req, res) => res.send("✅ Employee Monitoring API is running..."));
-
-/** Gate for frontend edit/delete controls */
-app.get("/update", (_req, res) => {
-  res.status(200).json({ ok: true });
-});
+app.get("/update", (_req, res) => res.status(200).json({ ok: true }));
 
 /* =========================
    Config
@@ -182,43 +188,40 @@ app.get("/config", async (_req, res) => {
     res.json({
       generalIdleLimit: s.general_idle_limit ?? 60,
       namazLimit: s.namaz_limit ?? 50,
-      categoryColors: {
-        Official: "#3b82f6",
-        General:  "#f59e0b",
-        Namaz:    "#10b981",
-        AutoBreak:"#ef4444",
-      },
+      categoryColors: { Official: "#3b82f6", General: "#f59e0b", Namaz: "#10b981", AutoBreak: "#ef4444" },
     });
   } catch {
     res.json({
       generalIdleLimit: 60,
       namazLimit: 50,
-      categoryColors: {
-        Official: "#3b82f6",
-        General:  "#f59e0b",
-        Namaz:    "#10b981",
-        AutoBreak:"#ef4444",
-      },
+      categoryColors: { Official: "#3b82f6", General: "#f59e0b", Namaz: "#10b981", AutoBreak: "#ef4444" },
     });
   }
 });
 
 /* =========================
    Employees (READ) — optimized
-   Supports optional ?from=YYYY-MM-DD&to=YYYY-MM-DD
+   Supports ?from=YYYY-MM-DD&to=YYYY-MM-DD
+   Defaults to last 30 days if omitted
    ========================= */
 app.get("/employees", async (req, res) => {
   try {
-    // avoid 304 revalidation; always return body
+    // never 304 here; always send body
     res.set("Cache-Control", "no-store");
 
-    const { from, to } = req.query || {};
-    let range = null;
-    if (from && to) {
-      const start = new Date(from + "T00:00:00.000Z");
-      const end   = new Date(to   + "T23:59:59.999Z");
-      range = { start, end };
+    let { from, to } = req.query || {};
+    if (!from || !to) {
+      // default to last 30 days to keep payloads sane
+      const now = new Date();
+      const start = new Date(now);
+      start.setUTCDate(start.getUTCDate() - 30);
+      from = from || start.toISOString().slice(0, 10);
+      to   = to   || now.toISOString().slice(0, 10);
     }
+    const range = {
+      start: new Date(from + "T00:00:00.000Z"),
+      end:   new Date(to   + "T23:59:59.999Z"),
+    };
 
     const users = await User.find(
       {},
@@ -227,26 +230,21 @@ app.get("/employees", async (req, res) => {
 
     const settings = (await Settings.findOne().lean()) || { general_idle_limit: 60, namaz_limit: 50 };
 
-    if (!users.length) {
-      return res.json({ employees: [], settings });
-    }
+    if (!users.length) return res.json({ employees: [], settings });
 
     const employees = await Promise.all(
       users.map(async (u) => {
-        // build filters (aligned with indexes)
-        const logFilter = { user: u.name };
-        const abFilter  = { user: u.name };
+        const logFilter = {
+          user: u.name,
+          idle_start: { $lte: range.end },
+          $or: [{ idle_end: { $exists: false } }, { idle_end: { $gte: range.start } }],
+        };
+        const abFilter = {
+          user: u.name,
+          break_start: { $lte: range.end },
+          $or: [{ break_end: { $exists: false } }, { break_end: { $gte: range.start } }],
+        };
 
-        if (range) {
-          // overlap with selected range
-          logFilter.idle_start = { $lte: range.end };
-          logFilter.$or = [{ idle_end: { $exists: false } }, { idle_end: { $gte: range.start } }];
-
-          abFilter.break_start = { $lte: range.end };
-          abFilter.$or = [{ break_end: { $exists: false } }, { break_end: { $gte: range.start } }];
-        }
-
-        // run in parallel, minimal fields, lean() + indexed sorts
         const [logs, abreaks] = await Promise.all([
           ActivityLog.find(
             logFilter,
@@ -258,21 +256,18 @@ app.get("/employees", async (req, res) => {
           ).sort({ break_start: 1 }).lean(),
         ]);
 
-        // ----- Idle Sessions -----
+        // transform: Idle
         const idleSessions = logs
-          .filter((log) => log.status === "Idle" && log.idle_start)
+          .filter((l) => l.status === "Idle" && l.idle_start)
           .map((log) => {
             const start = log.idle_start ? new Date(log.idle_start) : null;
             const end   = log.idle_end ? new Date(log.idle_end) : null;
-
             const duration = start
               ? end
                 ? Math.max(0, Math.round((end - start) / 60000))
                 : Math.max(0, Math.round((Date.now() - start) / 60000))
               : 0;
-
             const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
-
             return {
               _id: log._id,
               kind: "Idle",
@@ -292,19 +287,16 @@ app.get("/employees", async (req, res) => {
             };
           });
 
-        // ----- AutoBreak Sessions -----
+        // transform: AutoBreak
         const autoBreaks = abreaks.map((br) => {
           const start = br.break_start ? new Date(br.break_start) : null;
           const end   = br.break_end ? new Date(br.break_end) : null;
-
           const assigned   = assignShiftForUser(start, u);
           const shiftDate  = br.shiftDate  || assigned.shiftDate;
           const shiftLabel = br.shiftLabel || assigned.shiftLabel;
-
           let duration = typeof br.duration_minutes === "number" ? br.duration_minutes : null;
           if (duration == null && start && end) duration = Math.round((end - start) / 60000);
           if (duration == null) duration = 0;
-
           return {
             _id: br._id,
             kind: "AutoBreak",
@@ -324,7 +316,6 @@ app.get("/employees", async (req, res) => {
           };
         });
 
-        // merge & sort
         const merged = [...idleSessions, ...autoBreaks].sort((a, b) => {
           const at = a.idle_start ? new Date(a.idle_start).getTime() : 0;
           const bt = b.idle_start ? new Date(b.idle_start).getTime() : 0;
@@ -343,18 +334,16 @@ app.get("/employees", async (req, res) => {
           shift_start: u.shift_start,
           shift_end: u.shift_end,
           created_at: u.created_at,
-
           latest_status: latestStatus,
           has_ongoing_idle: hasOngoingIdle,
           has_ongoing_autobreak: hasOngoingAuto,
           is_in_shift_now: isInShiftNow(u.shift_start, u.shift_end),
-
           idle_sessions: merged,
         };
       })
     );
 
-    res.json({ employees, settings });
+    res.json({ employees, settings, range: { from, to } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch employees" });
@@ -401,7 +390,7 @@ app.delete("/employees/:id", async (req, res) => {
 });
 
 /* =========================
-   Activity Logs (UPDATE)
+   Activity Logs (UPDATE / CLOSE)
    ========================= */
 app.put("/activities/:id", async (req, res) => {
   try {
@@ -437,7 +426,6 @@ app.put("/activities/:id", async (req, res) => {
   }
 });
 
-/* Close an ongoing Idle activity NOW */
 app.put("/activities/:id/end", async (req, res) => {
   try {
     const { id } = req.params;
@@ -456,14 +444,13 @@ app.put("/activities/:id/end", async (req, res) => {
 });
 
 /* =========================
-   AutoBreaks (CLOSE NOW)
+   AutoBreaks (CLOSE NOW) & Delete Log
    ========================= */
 app.put("/autobreaks/:id/end", async (req, res) => {
   try {
     const { id } = req.params;
     const br = await AutoBreak.findById(id);
     if (!br) return res.status(404).json({ error: "AutoBreak not found" });
-
     if (!br.break_start) return res.status(400).json({ error: "AutoBreak has no break_start" });
     if (br.break_end) return res.status(400).json({ error: "AutoBreak already closed" });
 
@@ -478,7 +465,6 @@ app.put("/autobreaks/:id/end", async (req, res) => {
   }
 });
 
-/* (optional) delete an activity log */
 app.delete("/activities/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -496,7 +482,8 @@ app.delete("/activities/:id", async (req, res) => {
    ========================= */
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
-// Optional: fail fast instead of hanging forever
+// Reasonable timeouts (fail fast instead of hanging forever)
 server.requestTimeout = 30000;
 server.headersTimeout = 65000;
+
 
