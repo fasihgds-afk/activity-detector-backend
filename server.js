@@ -3,7 +3,10 @@ import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
 import { DateTime } from "luxon";
+<<<<<<< HEAD
 import jwt from "jsonwebtoken";
+=======
+>>>>>>> 697531f (first)
 
 /* =========================
    App / Middleware
@@ -170,6 +173,7 @@ function deriveLatestStatus(logs) {
 }
 
 /* =========================
+<<<<<<< HEAD
    Auth helpers (JWT + RBAC)
    ========================= */
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
@@ -197,6 +201,8 @@ function requireRole(...roles) {
 }
 
 /* =========================
+=======
+>>>>>>> 697531f (first)
    Health & Gate
    ========================= */
 app.get("/healthz", (_req, res) => res.send("ok"));
@@ -204,6 +210,7 @@ app.get("/", (_req, res) => res.send("✅ Employee Monitoring API is running..."
 app.get("/update", (_req, res) => res.status(200).json({ ok: true }));
 
 /* =========================
+<<<<<<< HEAD
    Auth
    ========================= */
 app.post("/auth/login", express.json(), async (req, res) => {
@@ -235,6 +242,8 @@ app.post("/auth/login", express.json(), async (req, res) => {
 app.get("/auth/me", authRequired, (req, res) => res.json({ ok: true, user: req.user }));
 
 /* =========================
+=======
+>>>>>>> 697531f (first)
    Config
    ========================= */
 app.get("/config", async (_req, res) => {
@@ -257,7 +266,11 @@ app.get("/config", async (_req, res) => {
 /* =========================
    Employees (READ) — 7-day default (max 31)
    ========================= */
+<<<<<<< HEAD
 app.get("/employees", authRequired, async (req, res) => {
+=======
+app.get("/employees", async (req, res) => {
+>>>>>>> 697531f (first)
   try {
     res.set("Cache-Control", "no-store");
 
@@ -281,6 +294,7 @@ app.get("/employees", authRequired, async (req, res) => {
 
     const range = { start: startISO, end: endISO };
 
+<<<<<<< HEAD
     // 👇 RBAC: employees can only see themselves
     const baseProjection = { name: 1, emp_id: 1, department: 1, shift_start: 1, shift_end: 1, created_at: 1 };
     let userFindQuery = {};
@@ -288,6 +302,10 @@ app.get("/employees", authRequired, async (req, res) => {
 
     const [users, settingsDoc] = await Promise.all([
       User.find(userFindQuery, baseProjection).lean(),
+=======
+    const [users, settingsDoc] = await Promise.all([
+      User.find({}, { name: 1, emp_id: 1, department: 1, shift_start: 1, shift_end: 1, created_at: 1 }).lean(),
+>>>>>>> 697531f (first)
       Settings.findOne().lean(),
     ]);
     const settings = settingsDoc || { general_idle_limit: 60, namaz_limit: 50 };
@@ -410,7 +428,11 @@ app.get("/employees", authRequired, async (req, res) => {
 /* =========================
    Employees (UPDATE / DELETE)
    ========================= */
+<<<<<<< HEAD
 app.put("/employees/:id", authRequired, requireRole("superadmin"), async (req, res) => {
+=======
+app.put("/employees/:id", async (req, res) => {
+>>>>>>> 697531f (first)
   try {
     const { id } = req.params;
     const { name, department, shift_start, shift_end } = req.body || {};
@@ -432,7 +454,11 @@ app.put("/employees/:id", authRequired, requireRole("superadmin"), async (req, r
   }
 });
 
+<<<<<<< HEAD
 app.delete("/employees/:id", authRequired, requireRole("superadmin"), async (req, res) => {
+=======
+app.delete("/employees/:id", async (req, res) => {
+>>>>>>> 697531f (first)
   try {
     const { id } = req.params;
     let result = null;
@@ -449,7 +475,11 @@ app.delete("/employees/:id", authRequired, requireRole("superadmin"), async (req
 /* =========================
    Activity Logs (UPDATE / CLOSE / DELETE)
    ========================= */
+<<<<<<< HEAD
 app.put("/activities/:id", authRequired, requireRole("superadmin"), async (req, res) => {
+=======
+app.put("/activities/:id", async (req, res) => {
+>>>>>>> 697531f (first)
   try {
     const { id } = req.params;
     const { reason, category, status, idle_start, idle_end } = req.body || {};
@@ -483,7 +513,11 @@ app.put("/activities/:id", authRequired, requireRole("superadmin"), async (req, 
   }
 });
 
+<<<<<<< HEAD
 app.put("/activities/:id/end", authRequired, requireRole("superadmin"), async (req, res) => {
+=======
+app.put("/activities/:id/end", async (req, res) => {
+>>>>>>> 697531f (first)
   try {
     const { id } = req.params;
     const log = await ActivityLog.findById(id);
@@ -501,7 +535,11 @@ app.put("/activities/:id/end", authRequired, requireRole("superadmin"), async (r
 });
 
 /* delete an activity log (Idle only) */
+<<<<<<< HEAD
 app.delete("/activities/:id", authRequired, requireRole("superadmin"), async (req, res) => {
+=======
+app.delete("/activities/:id", async (req, res) => {
+>>>>>>> 697531f (first)
   try {
     const { id } = req.params;
     const deleted = await ActivityLog.findByIdAndDelete(id);
@@ -525,4 +563,7 @@ server.headersTimeout = 65000;
 
 
 
+<<<<<<< HEAD
 
+=======
+>>>>>>> 697531f (first)
