@@ -8,11 +8,8 @@ import { DateTime } from "luxon";
    App / Middleware
    ========================= */
 const app = express();
-
-// Avoid slow 304 revalidation paths
 app.set("etag", false);
 
-// Simple latency logging
 app.use((req, res, next) => {
   const t0 = process.hrtime.bigint();
   res.on("finish", () => {
@@ -38,7 +35,6 @@ app.use(express.json({ limit: "1mb" }));
 const mongoUri = process.env.MONGODB_URI;
 if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set.");
 
-// allow building indexes when env says so (production disables by default)
 mongoose.set("autoIndex", process.env.MONGOOSE_AUTO_INDEX === "true");
 
 mongoose
@@ -84,7 +80,7 @@ const settingsSchema = new mongoose.Schema({
   created_at: { type: Date, default: Date.now },
 });
 
-// 🔥 indexes for fast lookups/sorts
+// 🔥 indexes
 userSchema.index({ emp_id: 1 });
 userSchema.index({ name: 1 });
 activitySchema.index({ user: 1, timestamp: 1 });
@@ -93,13 +89,12 @@ activitySchema.index({ user: 1, idle_end: 1 });
 autoBreakSchema.index({ user: 1, break_start: 1 });
 autoBreakSchema.index({ user: 1, break_end: 1 });
 
-/* IMPORTANT: explicit collection names */
+/* collection names */
 const User        = mongoose.model("User", userSchema, "users");
 const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs");
 const AutoBreak   = mongoose.model("AutoBreak", autoBreakSchema, "auto_break_logs");
 const Settings    = mongoose.model("Settings", settingsSchema, "settings");
 
-/* Build indexes once when env flags set */
 async function maybeSyncIndexes() {
   if (process.env.SYNC_INDEXES === "true") {
     console.time("syncIndexes");
@@ -201,7 +196,7 @@ app.get("/config", async (_req, res) => {
 });
 
 /* =========================
-   Employees (READ) — fast + 7-day default window (max 31)
+   Employees (READ) — 7-day default (max 31)
    ========================= */
 app.get("/employees", async (req, res) => {
   try {
@@ -220,7 +215,6 @@ app.get("/employees", async (req, res) => {
       to   = to   || ymd(now);
     }
 
-    // Hard cap window to most recent DAYS_MAX
     let startISO = new Date(from + "T00:00:00.000Z");
     const endISO = new Date(to   + "T23:59:59.999Z");
     const diffDays = Math.ceil((endISO - startISO) / 86_400_000);
@@ -389,7 +383,7 @@ app.delete("/employees/:id", async (req, res) => {
 });
 
 /* =========================
-   Activity Logs (UPDATE / CLOSE)
+   Activity Logs (UPDATE / CLOSE / DELETE)
    ========================= */
 app.put("/activities/:id", async (req, res) => {
   try {
@@ -442,28 +436,7 @@ app.put("/activities/:id/end", async (req, res) => {
   }
 });
 
-/* =========================
-   AutoBreaks (CLOSE NOW) & Delete Log
-   ========================= */
-app.put("/autobreaks/:id/end", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const br = await AutoBreak.findById(id);
-    if (!br) return res.status(404).json({ error: "AutoBreak not found" });
-    if (!br.break_start) return res.status(400).json({ error: "AutoBreak has no break_start" });
-    if (br.break_end) return res.status(400).json({ error: "AutoBreak already closed" });
-
-    const now = new Date();
-    br.break_end = now;
-    br.duration_minutes = Math.max(0, Math.round((now - br.break_start) / 60000));
-    await br.save();
-    res.json({ ok: true, autoBreak: br });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to close autobreak" });
-  }
-});
-
+/* delete an activity log (Idle only) */
 app.delete("/activities/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -483,6 +456,7 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
 server.requestTimeout = 30000;
 server.headersTimeout = 65000;
+
 
 
 
