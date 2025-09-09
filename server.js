@@ -3,6 +3,7 @@ import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
 import { DateTime } from "luxon";
+import jwt from "jsonwebtoken";
 
 /* =========================
    App / Middleware
@@ -169,11 +170,69 @@ function deriveLatestStatus(logs) {
 }
 
 /* =========================
+   Auth helpers (JWT + RBAC)
+   ========================= */
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+
+function signToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+}
+function readToken(req) {
+  const h = req.headers.authorization || "";
+  const m = h.match(/^Bearer\s+(.+)/i);
+  return m ? m[1] : null;
+}
+function authRequired(req, res, next) {
+  const t = readToken(req);
+  if (!t) return res.status(401).json({ error: "Unauthorized" });
+  try { req.user = jwt.verify(t, JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: "Invalid token" }); }
+}
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (!roles.includes(req.user.role)) return res.status(403).json({ error: "Forbidden" });
+    next();
+  };
+}
+
+/* =========================
    Health & Gate
    ========================= */
 app.get("/healthz", (_req, res) => res.send("ok"));
 app.get("/", (_req, res) => res.send("✅ Employee Monitoring API is running..."));
 app.get("/update", (_req, res) => res.status(200).json({ ok: true }));
+
+/* =========================
+   Auth
+   ========================= */
+app.post("/auth/login", express.json(), async (req, res) => {
+  try {
+    const { identifier, password } = req.body || {};
+
+    // superadmin
+    if (identifier === (process.env.SUPERADMIN_USER || "") && password === (process.env.SUPERADMIN_PASS || "")) {
+      const token = signToken({ role: "superadmin", username: identifier });
+      return res.json({ ok: true, token, user: { role: "superadmin", username: identifier } });
+    }
+    // admin
+    if (identifier === (process.env.ADMIN_USER || "") && password === (process.env.ADMIN_PASS || "")) {
+      const token = signToken({ role: "admin", username: identifier });
+      return res.json({ ok: true, token, user: { role: "admin", username: identifier } });
+    }
+    // employee by emp_id (no password)
+    const emp = await User.findOne({ emp_id: String(identifier || "").trim() }).lean();
+    if (!emp) return res.status(401).json({ error: "Invalid credentials" });
+
+    const token = signToken({ role: "employee", emp_id: emp.emp_id, name: emp.name, userId: String(emp._id) });
+    return res.json({ ok: true, token, user: { role: "employee", emp_id: emp.emp_id, name: emp.name, userId: String(emp._id) } });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+app.get("/auth/me", authRequired, (req, res) => res.json({ ok: true, user: req.user }));
 
 /* =========================
    Config
@@ -198,7 +257,7 @@ app.get("/config", async (_req, res) => {
 /* =========================
    Employees (READ) — 7-day default (max 31)
    ========================= */
-app.get("/employees", async (req, res) => {
+app.get("/employees", authRequired, async (req, res) => {
   try {
     res.set("Cache-Control", "no-store");
 
@@ -222,8 +281,13 @@ app.get("/employees", async (req, res) => {
 
     const range = { start: startISO, end: endISO };
 
+    // 👇 RBAC: employees can only see themselves
+    const baseProjection = { name: 1, emp_id: 1, department: 1, shift_start: 1, shift_end: 1, created_at: 1 };
+    let userFindQuery = {};
+    if (req.user?.role === "employee") userFindQuery = { emp_id: req.user.emp_id };
+
     const [users, settingsDoc] = await Promise.all([
-      User.find({}, { name: 1, emp_id: 1, department: 1, shift_start: 1, shift_end: 1, created_at: 1 }).lean(),
+      User.find(userFindQuery, baseProjection).lean(),
       Settings.findOne().lean(),
     ]);
     const settings = settingsDoc || { general_idle_limit: 60, namaz_limit: 50 };
@@ -346,7 +410,7 @@ app.get("/employees", async (req, res) => {
 /* =========================
    Employees (UPDATE / DELETE)
    ========================= */
-app.put("/employees/:id", async (req, res) => {
+app.put("/employees/:id", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, department, shift_start, shift_end } = req.body || {};
@@ -368,7 +432,7 @@ app.put("/employees/:id", async (req, res) => {
   }
 });
 
-app.delete("/employees/:id", async (req, res) => {
+app.delete("/employees/:id", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     let result = null;
@@ -385,7 +449,7 @@ app.delete("/employees/:id", async (req, res) => {
 /* =========================
    Activity Logs (UPDATE / CLOSE / DELETE)
    ========================= */
-app.put("/activities/:id", async (req, res) => {
+app.put("/activities/:id", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const { reason, category, status, idle_start, idle_end } = req.body || {};
@@ -419,7 +483,7 @@ app.put("/activities/:id", async (req, res) => {
   }
 });
 
-app.put("/activities/:id/end", async (req, res) => {
+app.put("/activities/:id/end", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const log = await ActivityLog.findById(id);
@@ -437,7 +501,7 @@ app.put("/activities/:id/end", async (req, res) => {
 });
 
 /* delete an activity log (Idle only) */
-app.delete("/activities/:id", async (req, res) => {
+app.delete("/activities/:id", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const deleted = await ActivityLog.findByIdAndDelete(id);
@@ -456,6 +520,7 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
 server.requestTimeout = 30000;
 server.headersTimeout = 65000;
+
 
 
 
