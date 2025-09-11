@@ -1,16 +1,16 @@
-// server.js
+// server.js — optimized for admin (no timeouts) and TODAY-first defaults
+// Node 18+ / ESM (package.json must include: { "type": "module" })
+
 import express from "express";
 import cors from "cors";
-import compression from "compression";
 import mongoose from "mongoose";
 import { DateTime } from "luxon";
 import jwt from "jsonwebtoken";
 
-/* ========================= App / Middleware ========================= */
 const app = express();
 app.set("etag", false);
 
-// tiny perf log
+// simple latency logger
 app.use((req, res, next) => {
   const t0 = process.hrtime.bigint();
   res.on("finish", () => {
@@ -20,18 +20,33 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(compression());
+// Optional compression — will not crash if package isn't installed
+let compression = null;
+try {
+  ({ default: compression } = await import("compression"));
+} catch {
+  console.warn("ℹ️ compression not installed; continuing without it");
+}
+if (compression) app.use(compression());
 
-// CORS: set exact frontend origin(s) in env as comma-separated list
-const allowedOrigins = (process.env.CORS_ORIGIN || "https://activity-detector-admin-panel.vercel.app")
+// CORS
+const allowedOrigins = (process.env.CORS_ORIGIN || "*")
   .split(",")
   .map((s) => s.trim())
+  .map((v) => (v.includes("=") ? v.split("=").pop().trim() : v))
   .filter(Boolean);
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  })
+);
 
-app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json({ limit: "1mb" }));
 
-/* ========================= MongoDB ========================= */
+/***********************
+ * MongoDB
+ ***********************/
 const mongoUri = process.env.MONGODB_URI;
 if (!mongoUri) console.warn("⚠️ MONGODB_URI is not set.");
 mongoose.set("autoIndex", process.env.MONGOOSE_AUTO_INDEX === "true");
@@ -40,7 +55,9 @@ mongoose
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.error("❌ MongoDB Error:", err.message));
 
-/* ========================= Schemas / Models + Indexes ========================= */
+/***********************
+ * Schemas / Models
+ ***********************/
 const userSchema = new mongoose.Schema({
   name: String,
   emp_id: String,
@@ -52,9 +69,9 @@ const userSchema = new mongoose.Schema({
 
 const activitySchema = new mongoose.Schema({
   user: String,
-  status: String, // "Idle" | "Active" ...
+  status: String,
   reason: String,
-  category: String, // "General" | "Official" | "Namaz"
+  category: String,
   timestamp: Date,
   idle_start: Date,
   idle_end: Date,
@@ -79,18 +96,15 @@ const settingsSchema = new mongoose.Schema({
   created_at: { type: Date, default: Date.now },
 });
 
-// indexes
+// helpful indexes
 userSchema.index({ emp_id: 1 });
 userSchema.index({ name: 1 });
 activitySchema.index({ user: 1, timestamp: 1 });
 activitySchema.index({ user: 1, idle_start: 1 });
 activitySchema.index({ user: 1, idle_end: 1 });
-// compound for bulk window scans
-activitySchema.index({ user: 1, idle_start: 1, idle_end: 1 });
 autoBreakSchema.index({ user: 1, break_start: 1 });
 autoBreakSchema.index({ user: 1, break_end: 1 });
 
-/* collection names */
 const User = mongoose.model("User", userSchema, "users");
 const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs");
 const AutoBreak = mongoose.model("AutoBreak", autoBreakSchema, "auto_break_logs");
@@ -113,7 +127,9 @@ async function maybeSyncIndexes() {
 }
 maybeSyncIndexes().catch((e) => console.error("syncIndexes error", e));
 
-/* ========================= Helpers ========================= */
+/***********************
+ * Helpers
+ ***********************/
 const ZONE = "Asia/Karachi";
 
 function parseTimeToMinutes(str) {
@@ -138,11 +154,13 @@ function isInShiftNow(shiftStart, shiftEnd) {
 }
 
 function assignShiftForUser(sessionStart, user) {
-  if (!sessionStart) return { shiftDate: "Unknown", shiftLabel: `${user.shift_start} – ${user.shift_end}` };
+  if (!sessionStart)
+    return { shiftDate: "Unknown", shiftLabel: `${user.shift_start} – ${user.shift_end}` };
   const local = DateTime.fromJSDate(sessionStart, { zone: "utc" }).setZone(ZONE);
   const startMin = parseTimeToMinutes(user.shift_start);
   const endMin = parseTimeToMinutes(user.shift_end);
   if (startMin == null || endMin == null) {
+    // fallback labels
     const hour = local.hour;
     let label = "General";
     let date = local.startOf("day");
@@ -170,16 +188,38 @@ function deriveLatestStatus(logs) {
   return last?.status || "Unknown";
 }
 
-/* ========================= Auth helpers (JWT + RBAC) ========================= */
+// Simple promise pool
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let i = 0;
+  const workers = Array(Math.min(limit, items.length))
+    .fill(0)
+    .map(async () => {
+      while (true) {
+        const idx = i++;
+        if (idx >= items.length) break;
+        results[idx] = await fn(items[idx], idx);
+      }
+    });
+  await Promise.all(workers);
+  return results;
+}
+
+/***********************
+ * Auth (JWT + RBAC)
+ ***********************/
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
 }
+
 function readToken(req) {
   const h = req.headers.authorization || "";
   const m = h.match(/^Bearer\s+(.+)/i);
   return m ? m[1] : null;
 }
+
 function authRequired(req, res, next) {
   const t = readToken(req);
   if (!t) return res.status(401).json({ error: "Unauthorized" });
@@ -190,6 +230,7 @@ function authRequired(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
+
 function requireRole(...roles) {
   return (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: "Unauthorized" });
@@ -198,18 +239,25 @@ function requireRole(...roles) {
   };
 }
 
-/* ========================= Health & Gate ========================= */
+/***********************
+ * Health
+ ***********************/
 app.get("/healthz", (_req, res) => res.send("ok"));
 app.get("/", (_req, res) => res.send("✅ Employee Monitoring API is running..."));
 app.get("/update", (_req, res) => res.status(200).json({ ok: true }));
 
-/* ========================= Auth ========================= */
+/***********************
+ * Auth routes
+ ***********************/
 app.post("/auth/login", express.json(), async (req, res) => {
   try {
     const { identifier, password } = req.body || {};
 
     // superadmin
-    if (identifier === (process.env.SUPERADMIN_USER || "") && password === (process.env.SUPERADMIN_PASS || "")) {
+    if (
+      identifier === (process.env.SUPERADMIN_USER || "") &&
+      password === (process.env.SUPERADMIN_PASS || "")
+    ) {
       const token = signToken({ role: "superadmin", username: identifier });
       return res.json({ ok: true, token, user: { role: "superadmin", username: identifier } });
     }
@@ -233,7 +281,9 @@ app.post("/auth/login", express.json(), async (req, res) => {
 
 app.get("/auth/me", authRequired, (req, res) => res.json({ ok: true, user: req.user }));
 
-/* ========================= Config ========================= */
+/***********************
+ * Config
+ ***********************/
 app.get("/config", async (_req, res) => {
   try {
     const s = (await Settings.findOne().lean()) || { general_idle_limit: 60, namaz_limit: 50 };
@@ -261,15 +311,19 @@ app.get("/config", async (_req, res) => {
   }
 });
 
-/* ========================= Employees (FAST BULK) ========================= */
+/***********************
+ * Employees (READ)
+ * TODAY-first defaults; supports from,to,limit and name filter q
+ ***********************/
 app.get("/employees", authRequired, async (req, res) => {
   try {
     res.set("Cache-Control", "no-store");
 
-    const DAYS_DEFAULT = 7;
+    const DAYS_DEFAULT = 1; // 🔥 today by default (not 7)
     const DAYS_MAX = 31;
 
-    let { from, to } = req.query || {};
+    let { from, to, limit, q } = req.query || {};
+
     const now = new Date();
     const ymd = (d) => d.toISOString().slice(0, 10);
     const addDays = (date, n) => {
@@ -288,58 +342,70 @@ app.get("/employees", authRequired, async (req, res) => {
     const diffDays = Math.ceil((endISO - startISO) / 86_400_000);
     if (diffDays > DAYS_MAX) startISO = addDays(endISO, -DAYS_MAX);
 
-    // users (RBAC)
-    const baseProjection = { name: 1, emp_id: 1, department: 1, shift_start: 1, shift_end: 1, created_at: 1 };
+    const range = { start: startISO, end: endISO };
+
+    // RBAC
     let userFindQuery = {};
     if (req.user?.role === "employee") userFindQuery = { emp_id: req.user.emp_id };
 
+    if (q) userFindQuery.name = { $regex: String(q).trim(), $options: "i" };
+
+    const baseProjection = {
+      name: 1,
+      emp_id: 1,
+      department: 1,
+      shift_start: 1,
+      shift_end: 1,
+      created_at: 1,
+    };
+
+    const userLimit = Math.min(Math.max(parseInt(limit || "100", 10) || 100, 1), 500);
+
     const [users, settingsDoc] = await Promise.all([
-      User.find(userFindQuery, baseProjection).lean(),
+      User.find(userFindQuery, baseProjection).limit(userLimit).lean(),
       Settings.findOne().lean(),
     ]);
 
     const settings = settingsDoc || { general_idle_limit: 60, namaz_limit: 50 };
+
     if (!users.length) return res.json({ employees: [], settings, range: { from, to } });
 
-    const userNames = users.map((u) => u.name);
-    const userSet = new Set(userNames);
+    // Cap concurrency to avoid hammering the DB on admin
+    const employees = await mapLimit(users, 8, async (u) => {
+      const logFilter = {
+        user: u.name,
+        idle_start: { $lte: range.end },
+        $or: [{ idle_end: { $exists: false } }, { idle_end: { $gte: range.start } }],
+      };
+      const abFilter = {
+        user: u.name,
+        break_start: { $lte: range.end },
+        $or: [{ break_end: { $exists: false } }, { break_end: { $gte: range.start } }],
+      };
 
-    // bulk pull matching logs/autobreaks once
-    const [allLogs, allAuto] = await Promise.all([
-      ActivityLog.find(
-        {
-          user: { $in: userNames },
-          idle_start: { $lte: endISO },
-          $or: [{ idle_end: { $exists: false } }, { idle_end: { $gte: startISO } }],
-        },
-        { user: 1, status: 1, reason: 1, category: 1, timestamp: 1, idle_start: 1, idle_end: 1 }
-      )
-        .sort({ user: 1, idle_start: 1 })
-        .lean(),
-      AutoBreak.find(
-        {
-          user: { $in: userNames },
-          break_start: { $lte: endISO },
-          $or: [{ break_end: { $exists: false } }, { break_end: { $gte: startISO } }],
-        },
-        { user: 1, break_start: 1, break_end: 1, duration_minutes: 1, shiftDate: 1, shiftLabel: 1 }
-      )
-        .sort({ user: 1, break_start: 1 })
-        .lean(),
-    ]);
+      const [logs, abreaks] = await Promise.all([
+        ActivityLog.find(logFilter, {
+          status: 1,
+          reason: 1,
+          category: 1,
+          timestamp: 1,
+          idle_start: 1,
+          idle_end: 1,
+        })
+          .sort({ timestamp: 1 })
+          .lean(),
+        AutoBreak.find(abFilter, {
+          break_start: 1,
+          break_end: 1,
+          duration_minutes: 1,
+          shiftDate: 1,
+          shiftLabel: 1,
+        })
+          .sort({ break_start: 1 })
+          .lean(),
+      ]);
 
-    // group by user
-    const logsByUser = new Map(userNames.map((n) => [n, []]));
-    const autoByUser = new Map(userNames.map((n) => [n, []]));
-    for (const l of allLogs) if (userSet.has(l.user)) logsByUser.get(l.user).push(l);
-    for (const a of allAuto) if (userSet.has(a.user)) autoByUser.get(a.user).push(a);
-
-    const employees = users.map((u) => {
-      const userLogs = logsByUser.get(u.name) || [];
-      const userAuto = autoByUser.get(u.name) || [];
-
-      // transform activity logs -> idle_sessions[]
-      const idleSessions = userLogs
+      const idleSessions = logs
         .filter((log) => log.status === "Idle" && log.idle_start)
         .map((log) => {
           const start = log.idle_start ? new Date(log.idle_start) : null;
@@ -349,7 +415,6 @@ app.get("/employees", authRequired, async (req, res) => {
               ? Math.max(0, Math.round((end - start) / 60000))
               : Math.max(0, Math.round((Date.now() - start) / 60000))
             : 0;
-
           const { shiftDate, shiftLabel } = assignShiftForUser(start, u);
           return {
             _id: log._id,
@@ -370,8 +435,7 @@ app.get("/employees", authRequired, async (req, res) => {
           };
         });
 
-      // transform autobreaks -> idle_sessions[] of kind=AutoBreak
-      const autoBreaks = userAuto.map((br) => {
+      const autoBreaks = abreaks.map((br) => {
         const start = br.break_start ? new Date(br.break_start) : null;
         const end = br.break_end ? new Date(br.break_end) : null;
         const assigned = assignShiftForUser(start, u);
@@ -380,7 +444,6 @@ app.get("/employees", authRequired, async (req, res) => {
         let duration = typeof br.duration_minutes === "number" ? br.duration_minutes : null;
         if (duration == null && start && end) duration = Math.round((end - start) / 60000);
         if (duration == null) duration = 0;
-
         return {
           _id: br._id,
           kind: "AutoBreak",
@@ -406,11 +469,9 @@ app.get("/employees", authRequired, async (req, res) => {
         return at - bt;
       });
 
-      const hasOngoingIdle = userLogs.some(
-        (l) => l.status === "Idle" && l.idle_start && !l.idle_end
-      );
-      const hasOngoingAuto = userAuto.some((b) => b.break_start && !b.break_end);
-      const latestStatus = deriveLatestStatus(userLogs);
+      const hasOngoingIdle = logs.some((l) => l.status === "Idle" && l.idle_start && !l.idle_end);
+      const hasOngoingAuto = abreaks.some((b) => b.break_start && !b.break_end);
+      const latestStatus = deriveLatestStatus(logs);
 
       return {
         id: u._id,
@@ -435,7 +496,9 @@ app.get("/employees", authRequired, async (req, res) => {
   }
 });
 
-/* ========================= Employees (UPDATE / DELETE) ========================= */
+/***********************
+ * Employees (UPDATE / DELETE)
+ ***********************/
 app.put("/employees/:id", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
@@ -452,6 +515,7 @@ app.put("/employees/:id", authRequired, requireRole("superadmin"), async (req, r
     } catch (_) {}
     if (!doc) doc = await User.findOneAndUpdate({ emp_id: id }, update, { new: true });
     if (!doc) return res.status(404).json({ error: "Employee not found" });
+
     res.json({ ok: true, employee: doc });
   } catch (e) {
     console.error(e);
@@ -475,11 +539,14 @@ app.delete("/employees/:id", authRequired, requireRole("superadmin"), async (req
   }
 });
 
-/* ========================= Activity Logs (UPDATE / CLOSE / DELETE) ========================= */
+/***********************
+ * Activity Logs (UPDATE / CLOSE / DELETE)
+ ***********************/
 app.put("/activities/:id", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const { reason, category, status, idle_start, idle_end } = req.body || {};
+
     let doc = await ActivityLog.findById(id);
     if (!doc) return res.status(404).json({ error: "Log not found" });
 
@@ -492,15 +559,16 @@ app.put("/activities/:id", authRequired, requireRole("superadmin"), async (req, 
       if (isNaN(d.getTime())) return res.status(400).json({ error: "Invalid idle_start" });
       doc.idle_start = d;
     }
+
     if (idle_end !== undefined) {
-      if (idle_end === null || idle_end === "") {
-        doc.idle_end = undefined;
-      } else {
+      if (idle_end === null || idle_end === "") doc.idle_end = undefined;
+      else {
         const d2 = new Date(idle_end);
         if (isNaN(d2.getTime())) return res.status(400).json({ error: "Invalid idle_end" });
         doc.idle_end = d2;
       }
     }
+
     await doc.save();
     res.json({ ok: true, log: doc });
   } catch (err) {
@@ -537,9 +605,11 @@ app.delete("/activities/:id", authRequired, requireRole("superadmin"), async (re
   }
 });
 
-/* ========================= Start Server ========================= */
+/***********************
+ * Start server
+ ***********************/
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
-server.requestTimeout = 30000;
-server.headersTimeout = 65000;
+server.requestTimeout = 120000; // 120s — allow heavy admin queries
+server.headersTimeout = 125000;
 
