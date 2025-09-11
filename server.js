@@ -1,16 +1,3 @@
-Below are **complete drop-in files** you asked for. They:
-
-* Default **today-only** queries so pages open fast
-* Add **compound Mongo indexes** that match your overlap filters (fixes 499/timeout)
-* Use an **in-flight lock** to stop overlapping polls on the client
-* Extend axios **timeout to 120s** (or adjust) so browser doesn’t abort early
-* Keep your RBAC and data model
-
----
-
-## server.js (drop-in)
-
-```js
 // server.js — optimized for admin (no timeouts) and TODAY-first defaults
 // Node 18+ / ESM (package.json must include: { "type": "module" })
 
@@ -23,7 +10,7 @@ import jwt from "jsonwebtoken";
 const app = express();
 app.set("etag", false);
 
-// latency logger
+// simple latency logger
 app.use((req, res, next) => {
   const t0 = process.hrtime.bigint();
   res.on("finish", () => {
@@ -33,7 +20,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Optional compression — safe if missing
+// Optional compression — will not crash if package isn't installed
 let compression = null;
 try {
   ({ default: compression } = await import("compression"));
@@ -52,7 +39,6 @@ app.use(
   cors({
     origin: allowedOrigins,
     credentials: true,
-    maxAge: 86400, // cache preflight for 24h
   })
 );
 
@@ -110,19 +96,14 @@ const settingsSchema = new mongoose.Schema({
   created_at: { type: Date, default: Date.now },
 });
 
-// ⚡️ Indexes tuned for your queries
-userSchema.index({ emp_id: 1 }, { unique: true, sparse: true });
+// helpful indexes
+userSchema.index({ emp_id: 1 });
 userSchema.index({ name: 1 });
-userSchema.index({ department: 1 });
-
-// Overlap queries: user + idle_start/idle_end + sort by timestamp
-activitySchema.index({ user: 1, idle_start: 1, idle_end: 1 });
 activitySchema.index({ user: 1, timestamp: 1 });
-activitySchema.index({ user: 1, status: 1, idle_start: 1 }); // helps status lookups
-
-// Overlap queries for autobreak
-autoBreakSchema.index({ user: 1, break_start: 1, break_end: 1 });
+activitySchema.index({ user: 1, idle_start: 1 });
+activitySchema.index({ user: 1, idle_end: 1 });
 autoBreakSchema.index({ user: 1, break_start: 1 });
+autoBreakSchema.index({ user: 1, break_end: 1 });
 
 const User = mongoose.model("User", userSchema, "users");
 const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs");
@@ -179,6 +160,7 @@ function assignShiftForUser(sessionStart, user) {
   const startMin = parseTimeToMinutes(user.shift_start);
   const endMin = parseTimeToMinutes(user.shift_end);
   if (startMin == null || endMin == null) {
+    // fallback labels
     const hour = local.hour;
     let label = "General";
     let date = local.startOf("day");
@@ -206,6 +188,7 @@ function deriveLatestStatus(logs) {
   return last?.status || "Unknown";
 }
 
+// Simple promise pool
 async function mapLimit(items, limit, fn) {
   const results = new Array(items.length);
   let i = 0;
@@ -307,21 +290,36 @@ app.get("/config", async (_req, res) => {
     res.json({
       generalIdleLimit: s.general_idle_limit ?? 60,
       namazLimit: s.namaz_limit ?? 50,
-      categoryColors: { Official: "#3b82f6", General: "#f59e0b", Namaz: "#10b981", AutoBreak: "#ef4444" },
+      categoryColors: {
+        Official: "#3b82f6",
+        General: "#f59e0b",
+        Namaz: "#10b981",
+        AutoBreak: "#ef4444",
+      },
     });
   } catch {
-    res.json({ generalIdleLimit: 60, namazLimit: 50, categoryColors: { Official: "#3b82f6", General: "#f59e0b", Namaz: "#10b981", AutoBreak: "#ef4444" } });
+    res.json({
+      generalIdleLimit: 60,
+      namazLimit: 50,
+      categoryColors: {
+        Official: "#3b82f6",
+        General: "#f59e0b",
+        Namaz: "#10b981",
+        AutoBreak: "#ef4444",
+      },
+    });
   }
 });
 
 /***********************
- * Employees (READ) — TODAY-first default
+ * Employees (READ)
+ * TODAY-first defaults; supports from,to,limit and name filter q
  ***********************/
 app.get("/employees", authRequired, async (req, res) => {
   try {
     res.set("Cache-Control", "no-store");
 
-    const DAYS_DEFAULT = 1; // 🔥 today by default
+    const DAYS_DEFAULT = 1; // 🔥 today by default (not 7)
     const DAYS_MAX = 31;
 
     let { from, to, limit, q } = req.query || {};
@@ -346,11 +344,20 @@ app.get("/employees", authRequired, async (req, res) => {
 
     const range = { start: startISO, end: endISO };
 
-    // RBAC: employee sees self only
-    const baseProjection = { name: 1, emp_id: 1, department: 1, shift_start: 1, shift_end: 1, created_at: 1 };
+    // RBAC
     let userFindQuery = {};
     if (req.user?.role === "employee") userFindQuery = { emp_id: req.user.emp_id };
+
     if (q) userFindQuery.name = { $regex: String(q).trim(), $options: "i" };
+
+    const baseProjection = {
+      name: 1,
+      emp_id: 1,
+      department: 1,
+      shift_start: 1,
+      shift_end: 1,
+      created_at: 1,
+    };
 
     const userLimit = Math.min(Math.max(parseInt(limit || "100", 10) || 100, 1), 500);
 
@@ -363,6 +370,7 @@ app.get("/employees", authRequired, async (req, res) => {
 
     if (!users.length) return res.json({ employees: [], settings, range: { from, to } });
 
+    // Cap concurrency to avoid hammering the DB on admin
     const employees = await mapLimit(users, 8, async (u) => {
       const logFilter = {
         user: u.name,
@@ -376,10 +384,23 @@ app.get("/employees", authRequired, async (req, res) => {
       };
 
       const [logs, abreaks] = await Promise.all([
-        ActivityLog.find(logFilter, { status: 1, reason: 1, category: 1, timestamp: 1, idle_start: 1, idle_end: 1 })
+        ActivityLog.find(logFilter, {
+          status: 1,
+          reason: 1,
+          category: 1,
+          timestamp: 1,
+          idle_start: 1,
+          idle_end: 1,
+        })
           .sort({ timestamp: 1 })
           .lean(),
-        AutoBreak.find(abFilter, { break_start: 1, break_end: 1, duration_minutes: 1, shiftDate: 1, shiftLabel: 1 })
+        AutoBreak.find(abFilter, {
+          break_start: 1,
+          break_end: 1,
+          duration_minutes: 1,
+          shiftDate: 1,
+          shiftLabel: 1,
+        })
           .sort({ break_start: 1 })
           .lean(),
       ]);
@@ -400,8 +421,12 @@ app.get("/employees", authRequired, async (req, res) => {
             kind: "Idle",
             idle_start: start ? start.toISOString() : null,
             idle_end: end ? end.toISOString() : null,
-            start_time_local: start ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss") : "N/A",
-            end_time_local: end ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss") : "Ongoing",
+            start_time_local: start
+              ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
+              : "N/A",
+            end_time_local: end
+              ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
+              : "Ongoing",
             reason: log.reason,
             category: log.category,
             duration,
@@ -424,8 +449,12 @@ app.get("/employees", authRequired, async (req, res) => {
           kind: "AutoBreak",
           idle_start: start ? start.toISOString() : null,
           idle_end: end ? end.toISOString() : null,
-          start_time_local: start ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss") : "N/A",
-          end_time_local: end ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss") : "N/A",
+          start_time_local: start
+            ? DateTime.fromJSDate(start, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
+            : "N/A",
+          end_time_local: end
+            ? DateTime.fromJSDate(end, { zone: "utc" }).setZone(ZONE).toFormat("HH:mm:ss")
+            : "N/A",
           reason: "System Power Off / Startup",
           category: "AutoBreak",
           duration,
@@ -583,5 +612,4 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
 server.requestTimeout = 120000; // 120s — allow heavy admin queries
 server.headersTimeout = 125000;
-```
 
