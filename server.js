@@ -176,7 +176,7 @@ function signToken(payload) {
 }
 function readToken(req) {
   const h = req.headers.authorization || "";
-  ��const m = h.match(/^Bearer\s+(.+)/i);
+  const m = h.match(/^Bearer\s+(.+)/i);
   return m ? m[1] : null;
 }
 function authRequired(req, res, next) {
@@ -541,6 +541,5 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
 server.requestTimeout = 30000;
 server.headersTimeout = 65000;
-
 
 
