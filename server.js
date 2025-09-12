@@ -20,15 +20,40 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(compression());
-
-// CORS: set exact frontend origin(s) in env as comma-separated list
+/* ---------- CORS (robust, handles preflight) ---------- */
 const allowedOrigins = (process.env.CORS_ORIGIN || "https://activity-detector-admin-panel.vercel.app")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+const corsOpts = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // non-browser clients
+    return allowedOrigins.includes(origin) ? cb(null, true) : cb(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
+};
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+    res.header("Access-Control-Allow-Credentials", "true");
+  }
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.use(cors(corsOpts));
+app.options("*", cors(corsOpts));
+
+app.use(compression());
 app.use(express.json({ limit: "1mb" }));
 
 /* ========================= MongoDB ========================= */
@@ -176,7 +201,7 @@ function signToken(payload) {
 }
 function readToken(req) {
   const h = req.headers.authorization || "";
-  ��const m = h.match(/^Bearer\s+(.+)/i);
+  const m = h.match(/^Bearer\s+(.+)/i);
   return m ? m[1] : null;
 }
 function authRequired(req, res, next) {
@@ -223,7 +248,11 @@ app.post("/auth/login", express.json(), async (req, res) => {
     const emp = await User.findOne({ emp_id: String(identifier || "").trim() }).lean();
     if (!emp) return res.status(401).json({ error: "Invalid credentials" });
     const token = signToken({ role: "employee", emp_id: emp.emp_id, name: emp.name, userId: String(emp._id) });
-    return res.json({ ok: true, token, user: { role: "employee", emp_id: emp.emp_id, name: emp.name, userId: String(emp._id) } });
+    return res.json({
+      ok: true,
+      token,
+      user: { role: "employee", emp_id: emp.emp_id, name: emp.name, userId: String(emp._id) },
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Login failed" });
@@ -239,23 +268,13 @@ app.get("/config", async (_req, res) => {
     res.json({
       generalIdleLimit: s.general_idle_limit ?? 60,
       namazLimit: s.namaz_limit ?? 50,
-      categoryColors: {
-        Official: "#3b82f6",
-        General: "#f59e0b",
-        Namaz: "#10b981",
-        AutoBreak: "#ef4444",
-      },
+      categoryColors: { Official: "#3b82f6", General: "#f59e0b", Namaz: "#10b981", AutoBreak: "#ef4444" },
     });
   } catch {
     res.json({
       generalIdleLimit: 60,
       namazLimit: 50,
-      categoryColors: {
-        Official: "#3b82f6",
-        General: "#f59e0b",
-        Namaz: "#10b981",
-        AutoBreak: "#ef4444",
-      },
+      categoryColors: { Official: "#3b82f6", General: "#f59e0b", Namaz: "#10b981", AutoBreak: "#ef4444" },
     });
   }
 });
@@ -405,9 +424,7 @@ app.get("/employees", authRequired, async (req, res) => {
         return at - bt;
       });
 
-      const hasOngoingIdle = userLogs.some(
-        (l) => l.status === "Idle" && l.idle_start && !l.idle_end
-      );
+      const hasOngoingIdle = userLogs.some((l) => l.status === "Idle" && l.idle_start && !l.idle_end);
       const hasOngoingAuto = userAuto.some((b) => b.break_start && !b.break_end);
       const latestStatus = deriveLatestStatus(userLogs);
 
@@ -474,7 +491,8 @@ app.delete("/employees/:id", authRequired, requireRole("superadmin"), async (req
   }
 });
 
-/* ========================= Activity Logs (ADMIN or SUPERADMIN) ========================= */
+/* ========================= Activity Logs (UPDATE / CLOSE / DELETE) ========================= */
+/* <-- changed to allow both admin and superadmin --> */
 app.put("/activities/:id", authRequired, requireRole("admin", "superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
@@ -541,5 +559,6 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
 server.requestTimeout = 30000;
 server.headersTimeout = 65000;
+
 
 
