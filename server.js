@@ -21,32 +21,15 @@ app.use((req, res, next) => {
 });
 
 app.use(compression());
-app.use(express.json({ limit: "1mb" }));
 
-/* --------- CORS (robust; avoids path-to-regexp mistakes) --------- */
-/*
-  Set CORS_ORIGIN to a comma-separated list of **origins**, e.g.
-  CORS_ORIGIN=https://activity-detector-admin-panel.vercel.app,http://localhost:5173
-*/
-const allowedOrigins = (process.env.CORS_ORIGIN || "")
+// CORS: set exact frontend origin(s) in env as comma-separated list
+const allowedOrigins = (process.env.CORS_ORIGIN || "https://activity-detector-admin-panel.vercel.app")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const corsOptions = {
-  origin(origin, cb) {
-    // allow server-to-server or curl (no origin header)
-    if (!origin) return cb(null, true);
-    if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS: " + origin));
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  optionsSuccessStatus: 204,
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // handle preflight everywhere
+app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(express.json({ limit: "1mb" }));
 
 /* ========================= MongoDB ========================= */
 const mongoUri = process.env.MONGODB_URI;
@@ -106,6 +89,7 @@ activitySchema.index({ user: 1, idle_start: 1, idle_end: 1 }); // compound
 autoBreakSchema.index({ user: 1, break_start: 1 });
 autoBreakSchema.index({ user: 1, break_end: 1 });
 
+/* collection names */
 const User = mongoose.model("User", userSchema, "users");
 const ActivityLog = mongoose.model("ActivityLog", activitySchema, "activity_logs");
 const AutoBreak = mongoose.model("AutoBreak", autoBreakSchema, "auto_break_logs");
@@ -149,7 +133,7 @@ function isInShiftNow(shiftStart, shiftEnd) {
   const now = DateTime.now().setZone(ZONE);
   const m = now.hour * 60 + now.minute;
   if (e >= s) return m >= s && m <= e;
-  return m >= s || m <= e;
+  return m >= s || m <= e; // crosses midnight
 }
 
 function assignShiftForUser(sessionStart, user) {
@@ -192,7 +176,7 @@ function signToken(payload) {
 }
 function readToken(req) {
   const h = req.headers.authorization || "";
-  const m = h.match(/^Bearer\s+(.+)/i);
+  ��const m = h.match(/^Bearer\s+(.+)/i);
   return m ? m[1] : null;
 }
 function authRequired(req, res, next) {
@@ -219,7 +203,7 @@ app.get("/", (_req, res) => res.send("✅ Employee Monitoring API is running..."
 app.get("/update", (_req, res) => res.status(200).json({ ok: true }));
 
 /* ========================= Auth ========================= */
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", express.json(), async (req, res) => {
   try {
     const { identifier, password } = req.body || {};
 
@@ -379,14 +363,13 @@ app.get("/employees", authRequired, async (req, res) => {
               : "Ongoing",
             reason: log.reason,
             category: log.category,
-            status: log.status,
             duration,
             shiftDate,
             shiftLabel,
           };
         });
 
-      // transform autobreaks
+      // transform autobreaks -> idle_sessions[] of kind=AutoBreak
       const autoBreaks = userAuto.map((br) => {
         const start = br.break_start ? new Date(br.break_start) : null;
         const end = br.break_end ? new Date(br.break_end) : null;
@@ -422,7 +405,9 @@ app.get("/employees", authRequired, async (req, res) => {
         return at - bt;
       });
 
-      const hasOngoingIdle = userLogs.some((l) => l.status === "Idle" && l.idle_start && !l.idle_end);
+      const hasOngoingIdle = userLogs.some(
+        (l) => l.status === "Idle" && l.idle_start && !l.idle_end
+      );
       const hasOngoingAuto = userAuto.some((b) => b.break_start && !b.break_end);
       const latestStatus = deriveLatestStatus(userLogs);
 
@@ -450,7 +435,6 @@ app.get("/employees", authRequired, async (req, res) => {
 });
 
 /* ========================= Employees (UPDATE / DELETE) ========================= */
-// Keep these superadmin-only
 app.put("/employees/:id", authRequired, requireRole("superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
@@ -490,8 +474,7 @@ app.delete("/employees/:id", authRequired, requireRole("superadmin"), async (req
   }
 });
 
-/* ========================= Activity Logs (UPDATE / CLOSE / DELETE) ========================= */
-/*  👉 NOW admins **and** superadmins can modify/delete logs  */
+/* ========================= Activity Logs (ADMIN or SUPERADMIN) ========================= */
 app.put("/activities/:id", authRequired, requireRole("admin", "superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
@@ -558,3 +541,6 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
 server.requestTimeout = 30000;
 server.headersTimeout = 65000;
+
+
+
