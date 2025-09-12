@@ -85,8 +85,7 @@ userSchema.index({ name: 1 });
 activitySchema.index({ user: 1, timestamp: 1 });
 activitySchema.index({ user: 1, idle_start: 1 });
 activitySchema.index({ user: 1, idle_end: 1 });
-// compound for bulk window scans
-activitySchema.index({ user: 1, idle_start: 1, idle_end: 1 });
+activitySchema.index({ user: 1, idle_start: 1, idle_end: 1 }); // compound
 autoBreakSchema.index({ user: 1, break_start: 1 });
 autoBreakSchema.index({ user: 1, break_end: 1 });
 
@@ -177,7 +176,7 @@ function signToken(payload) {
 }
 function readToken(req) {
   const h = req.headers.authorization || "";
-  const m = h.match(/^Bearer\s+(.+)/i);
+  ��const m = h.match(/^Bearer\s+(.+)/i);
   return m ? m[1] : null;
 }
 function authRequired(req, res, next) {
@@ -475,8 +474,8 @@ app.delete("/employees/:id", authRequired, requireRole("superadmin"), async (req
   }
 });
 
-/* ========================= Activity Logs (UPDATE / CLOSE / DELETE) ========================= */
-app.put("/activities/:id", authRequired, requireRole("superadmin"), async (req, res) => {
+/* ========================= Activity Logs (ADMIN or SUPERADMIN) ========================= */
+app.put("/activities/:id", authRequired, requireRole("admin", "superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const { reason, category, status, idle_start, idle_end } = req.body || {};
@@ -509,7 +508,7 @@ app.put("/activities/:id", authRequired, requireRole("superadmin"), async (req, 
   }
 });
 
-app.put("/activities/:id/end", authRequired, requireRole("superadmin"), async (req, res) => {
+app.put("/activities/:id/end", authRequired, requireRole("admin", "superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const log = await ActivityLog.findById(id);
@@ -525,7 +524,7 @@ app.put("/activities/:id/end", authRequired, requireRole("superadmin"), async (r
   }
 });
 
-app.delete("/activities/:id", authRequired, requireRole("superadmin"), async (req, res) => {
+app.delete("/activities/:id", authRequired, requireRole("admin", "superadmin"), async (req, res) => {
   try {
     const { id } = req.params;
     const deleted = await ActivityLog.findByIdAndDelete(id);
@@ -542,4 +541,5 @@ const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
 server.requestTimeout = 30000;
 server.headersTimeout = 65000;
+
 
